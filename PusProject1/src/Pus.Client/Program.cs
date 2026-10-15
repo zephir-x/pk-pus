@@ -20,7 +20,7 @@ namespace Pus.Client
             // Loopback addresses: ::1 for IPv6, 127.0.0.1 for IPv4
             string serverIp = useIpv6 ? "::1" : "127.0.0.1";
             int port = 8080;
-            string message = "Hello from PUS Lab!";
+            string message = "Hello!";
 
             if (isRaw) RunRawClient(serverIp, port, message);
             else if (isTcp) RunTcpClient(serverIp, port, message, useIpv6);
