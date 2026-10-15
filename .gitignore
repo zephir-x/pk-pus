@@ -1,0 +1,6 @@
+# IDEs and Editors
+.idea/
+
+# .NET binary and compilation files
+[Bb]in/
+[Oo]bj/
