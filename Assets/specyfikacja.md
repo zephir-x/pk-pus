@@ -296,7 +296,7 @@ Protokół PVSP wdraża architekturę **Defense-in-Depth (obrona w głąb)**, ł
    * Klucz `hmacSecret` jest generowany dynamicznie przez serwer (CSPRNG - kryptograficznie bezpieczny generator liczb losowych) podczas logowania i przypisany wyłącznie do jednej sesji.
    * Modyfikacja dowolnego pola podpisanego wejścia, w tym `Message Type`, `Message ID`, `sessionToken`, `action`, `key`, `value` albo `timestamp`, powoduje niezgodność HMAC. `ERR_INVALID_HMAC (204)` kończy sesję po wysłaniu błędu.
 3. **Uwierzytelnienie (Authentication):**
-   *Dwuetapowe: serwer uwierzytelnia się certyfikatem X.509 podczas fazy TLS, natomiast klient uwierzytelnia się w fazie `AUTH` parą `username` + `password` powiązaną z jednorazowym `serverNonceEcho`. Po zalogowaniu tożsamość klienta reprezentuje krótkożyjący `sessionToken`.
+   * Dwuetapowe: serwer uwierzytelnia się certyfikatem X.509 podczas fazy TLS, natomiast klient uwierzytelnia się w fazie `AUTH` parą `username` + `password` powiązaną z jednorazowym `serverNonceEcho`. Po zalogowaniu tożsamość klienta reprezentuje krótkożyjący `sessionToken`.
 4. **Autoryzacja (Authorization - RBAC):**
    * Protokół definiuje kontrolę dostępu opartą na rolach (*Role-Based Access Control*):
      * Rola **`READ_ONLY`** - uprawnia wyłącznie do wywoływania akcji `"GET"` oraz `"LIST"`. Próba wywołania `"SET"` lub `"DELETE"` kończy się błędem `ERR_FORBIDDEN (203)`.

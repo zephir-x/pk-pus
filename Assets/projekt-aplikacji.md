@@ -112,7 +112,7 @@ flowchart TB
     Session -.-> Codec
     Session -.-> Crypto
     Session --> Auth
-        Auth --> Users_File
+    Auth --> Users_File
     Session --> Storage
     Session --> Logger
     Storage <--> DB_File
