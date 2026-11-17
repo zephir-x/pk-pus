@@ -4,3 +4,7 @@
 # .NET binary and compilation files
 [Bb]in/
 [Oo]bj/
+
+# PUS Main Project (PUS-Vault) - Runtime Secrets, PKI & Study Guide
+PusVault/certs/
+PusVault/STUDY_GUIDE.md
