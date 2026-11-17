@@ -1,6 +1,12 @@
 ﻿using System;
 using System.IO;
+using System.Net;
+using System.Net.Security;
+using System.Net.Sockets;
+using System.Security.Authentication;
+using System.Threading;
 using System.Threading.Tasks;
+using Pus.Vault.Common;
 using Pus.Vault.Server;
 using Xunit;
 
@@ -92,6 +98,110 @@ namespace Pus.Vault.Tests
 
             // Even with valid password, the 4th immediate attempt from locked-out IP is rejected
             Assert.False(auth.TryAuthenticate("admin", "AdminPass!123", "AA", "AA", "10.0.0.99", out _));
+        }
+        
+        [Fact]
+        public async Task ServerListenerAndSession_ShouldHandleFullTlsSession_AndEnforceStateAndHmac()
+        {
+            string certsDir = FindCertsDirectory();
+            string caCertPath = Path.Combine(certsDir, "ca.crt");
+            string serverCertPath = Path.Combine(certsDir, "server.crt");
+            string serverKeyPath = Path.Combine(certsDir, "server.key");
+
+            string usersPath = Path.Combine(_tempDir, "config", "users.json");
+            string storePath = Path.Combine(_tempDir, "data", "vault_store.json");
+            string logsDir = Path.Combine(_tempDir, "logs");
+
+            AuthAndRbacModule.ProvisionUsersFile(usersPath, "AdminPass!123", "ReaderPass!123");
+            var auth = new AuthAndRbacModule(usersPath);
+            var storage = new VaultStorageEngine(storePath);
+            var logger = new SecurityAuditLogger(logsDir);
+
+            using var cts = new CancellationTokenSource();
+            using var listener = new SocketConnectionListener(0, serverCertPath, serverKeyPath, auth, storage, logger);
+            listener.StartListening();
+            Task acceptTask = listener.AcceptLoopAsync(cts.Token);
+
+            // Connect with a raw TCP socket and wrap in TLS 1.3 SslStream using CustomRootTrust
+            using var clientSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            await clientSocket.ConnectAsync(new IPEndPoint(IPAddress.Loopback, listener.BoundPort));
+            using var netStream = new NetworkStream(clientSocket, ownsSocket: true);
+            using var sslStream = new SslStream(
+                netStream,
+                false,
+                (_, cert, chain, errors) => PvspCryptoHelper.ValidateServerCertificateCustomCa(cert, chain, errors, caCertPath));
+
+            await sslStream.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
+            {
+                TargetHost = "localhost",
+                EnabledSslProtocols = SslProtocols.Tls13
+            });
+
+            // 1. Send HELLO (MsgID = 1)
+            long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            byte[] helloBytes = PvspJsonSerializer.SerializeToUtf8Bytes(new HelloPayload { ClientName = "TestClient/1.0", Timestamp = now });
+            await PvspFrameCodec.WriteFrameAsync(sslStream, PvspMessageType.Hello, 1, helloBytes, CancellationToken.None);
+
+            FrameReadResult helloAckRes = await PvspFrameCodec.ReadFrameAsync(sslStream, CancellationToken.None);
+            Assert.Equal(PvspMessageType.HelloAck, helloAckRes.Frame.MessageType);
+            var helloAck = System.Text.Json.JsonSerializer.Deserialize<HelloAckPayload>(helloAckRes.Frame.PayloadBytes)!;
+
+            // 2. Attempt DATA_REQ before AUTH -> should receive 202 ERR_UNAUTHORIZED_STATE and stay open
+            var prematureReq = new DataReqPayload { SessionToken = "none", Action = "LIST", Timestamp = now, Hmac = new string('0', 64) };
+            await PvspFrameCodec.WriteFrameAsync(sslStream, PvspMessageType.DataReq, 2, PvspJsonSerializer.SerializeToUtf8Bytes(prematureReq), CancellationToken.None);
+            FrameReadResult errRes = await PvspFrameCodec.ReadFrameAsync(sslStream, CancellationToken.None);
+            Assert.Equal(PvspMessageType.Error, errRes.Frame.MessageType);
+            var errPayload = System.Text.Json.JsonSerializer.Deserialize<ErrorPayload>(errRes.Frame.PayloadBytes)!;
+            Assert.Equal(PvspErrorCodes.UnauthorizedState, errPayload.ErrorCode);
+
+            // 3. Send valid AUTH (MsgID = 2, since previous frame did not advance sequence in HANDSHAKED state)
+            var authReq = new AuthPayload
+            {
+                Username = "admin",
+                Password = "AdminPass!123",
+                ServerNonceEcho = helloAck.ServerNonce,
+                Timestamp = now
+            };
+            await PvspFrameCodec.WriteFrameAsync(sslStream, PvspMessageType.Auth, 2, PvspJsonSerializer.SerializeToUtf8Bytes(authReq), CancellationToken.None);
+            FrameReadResult authAckRes = await PvspFrameCodec.ReadFrameAsync(sslStream, CancellationToken.None);
+            Assert.Equal(PvspMessageType.AuthAck, authAckRes.Frame.MessageType);
+            var authAck = System.Text.Json.JsonSerializer.Deserialize<AuthAckPayload>(authAckRes.Frame.PayloadBytes)!;
+
+            // 4. Send valid SET (MsgID = 3)
+            var setReq = new DataReqPayload
+            {
+                SessionToken = authAck.SessionToken,
+                Action = "SET",
+                Key = "API_TOKEN",
+                Value = "xyz-987",
+                Timestamp = now
+            };
+            setReq.Hmac = PvspCryptoHelper.ComputeDataReqHmacHex(authAck.HmacSecret, 3, setReq);
+            await PvspFrameCodec.WriteFrameAsync(sslStream, PvspMessageType.DataReq, 3, PvspJsonSerializer.SerializeToUtf8Bytes(setReq), CancellationToken.None);
+
+            FrameReadResult setResp = await PvspFrameCodec.ReadFrameAsync(sslStream, CancellationToken.None);
+            Assert.Equal(PvspMessageType.DataResp, setResp.Frame.MessageType);
+
+            // 5. Send BYE (MsgID = 4)
+            await PvspFrameCodec.WriteFrameAsync(sslStream, PvspMessageType.Bye, 4, Array.Empty<byte>(), CancellationToken.None);
+
+            cts.Cancel();
+            await acceptTask;
+        }
+
+        private static string FindCertsDirectory()
+        {
+            DirectoryInfo? dir = new DirectoryInfo(AppContext.BaseDirectory);
+            while (dir != null)
+            {
+                string candidate = Path.Combine(dir.FullName, "certs");
+                if (Directory.Exists(candidate) && File.Exists(Path.Combine(candidate, "ca.crt")))
+                {
+                    return candidate;
+                }
+                dir = dir.Parent;
+            }
+            throw new DirectoryNotFoundException("Could not locate 'certs/' directory. Run './scripts/generate_certs.sh' first.");
         }
 
         public void Dispose()

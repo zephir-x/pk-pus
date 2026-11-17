@@ -7,4 +7,7 @@
 
 # PUS Main Project (PUS-Vault) - Runtime Secrets, PKI & Study Guide
 PusVault/certs/
+PusVault/config/
+PusVault/data/
+PusVault/logs/
 PusVault/STUDY_GUIDE.md
