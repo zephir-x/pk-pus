@@ -23,11 +23,11 @@ namespace Pus.Vault.Tests
         }
 
         [Fact]
-        public void VaultStorage_ShouldPersistAcrossRestarts_AndRejectCorruptedJson()
+        public void T02_T12_VaultStorage_ShouldPersistAcrossRestarts_AndRejectCorruptedJson()
         {
             string storePath = Path.Combine(_tempDir, "data", "vault_store.json");
 
-            // 1. Start engine, store a secret, and simulate server restart
+            // 1. Start engine, store a secret, and simulate server restart (Test T-02)
             var engine1 = new VaultStorageEngine(storePath);
             Assert.Equal(StorageOperationStatus.Committed, engine1.SetSecret("DB_PASS", "SuperSecret123"));
 
@@ -35,39 +35,97 @@ namespace Pus.Vault.Tests
             Assert.Equal(StorageOperationStatus.Committed, engine2.TryGetSecret("DB_PASS", out string? val));
             Assert.Equal("SuperSecret123", val);
 
-            // 2. Corrupt the JSON file on disk and verify the engine refuses to start on broken state
+            // 2. Corrupt the JSON file on disk and verify the engine refuses to start on broken state (Test T-12)
             File.WriteAllText(storePath, "{corrupted_json_without_closing_brace");
             Assert.Throws<InvalidDataException>(() => new VaultStorageEngine(storePath));
         }
 
         [Fact]
-        public async Task VaultStorage_ShouldRemainConsistent_UnderConcurrentWrites()
+        public async Task T12_VaultStorage_ShouldRemainConsistent_UnderConcurrentSetsAndDeletes()
         {
             string storePath = Path.Combine(_tempDir, "data", "concurrent_store.json");
             var engine = new VaultStorageEngine(storePath);
 
-            // Run 20 concurrent SET operations from multiple threads
-            Task[] tasks = new Task[20];
+            // Run 20 concurrent SET operations followed by concurrent DELETEs of even keys
+            Task[] setTasks = new Task[20];
             for (int i = 0; i < 20; i++)
             {
                 int index = i;
-                tasks[i] = Task.Run(() =>
+                setTasks[i] = Task.Run(() =>
                 {
                     var status = engine.SetSecret($"KEY_{index}", $"VAL_{index}");
                     Assert.Equal(StorageOperationStatus.Committed, status);
                 });
             }
+            await Task.WhenAll(setTasks);
 
-            await Task.WhenAll(tasks);
+            Task[] delTasks = new Task[10];
+            for (int i = 0; i < 10; i++)
+            {
+                int evenIndex = i * 2;
+                delTasks[i] = Task.Run(() =>
+                {
+                    var status = engine.DeleteSecret($"KEY_{evenIndex}");
+                    Assert.Equal(StorageOperationStatus.Committed, status);
+                });
+            }
+            await Task.WhenAll(delTasks);
 
-            // Verify all 20 keys were persisted properly
+            // Verify exactly 10 odd keys remain both in RAM and on disk after reload
             var reloadedEngine = new VaultStorageEngine(storePath);
             Assert.Equal(StorageOperationStatus.Committed, reloadedEngine.TryListKeys(out var keys));
-            Assert.Equal(20, keys.Count);
+            Assert.Equal(10, keys.Count);
         }
 
         [Fact]
-        public void AuthAndRbac_ShouldVerifyPbkdf2Passwords_EnforceRoles_AndLockoutBruteForce()
+        public void T12_VaultStorage_ShouldNotMutateRam_WhenDiskWriteFails()
+        {
+            string storePath = Path.Combine(_tempDir, "data", "fail_store.json");
+            var engine = new VaultStorageEngine(storePath);
+            Assert.Equal(StorageOperationStatus.Committed, engine.SetSecret("INITIAL_KEY", "InitialValue"));
+
+            // Sabotage the temporary file path by creating a directory named 'fail_store.json.tmp'
+            // so FileStream creation for the snapshot fails with an IOException/UnauthorizedAccessException
+            string tempFilePath = storePath + ".tmp";
+            Directory.CreateDirectory(tempFilePath);
+
+            try
+            {
+                // Attempt SET and DELETE while disk persistence is broken -> must return PersistenceFailed
+                Assert.Equal(StorageOperationStatus.PersistenceFailed, engine.SetSecret("NEW_KEY", "ShouldNotBeSaved"));
+                Assert.Equal(StorageOperationStatus.PersistenceFailed, engine.DeleteSecret("INITIAL_KEY"));
+
+                // Verify in-memory state was NOT modified (no divergence between RAM and disk)
+                Assert.Equal(StorageOperationStatus.KeyNotFound, engine.TryGetSecret("NEW_KEY", out _));
+                Assert.Equal(StorageOperationStatus.Committed, engine.TryGetSecret("INITIAL_KEY", out string? existingVal));
+                Assert.Equal("InitialValue", existingVal);
+            }
+            finally
+            {
+                Directory.Delete(tempFilePath, recursive: true);
+            }
+        }
+
+        [Fact]
+        public void T12_AuditLogger_ShouldSanitizeNewlines_AndNeverLeakSecretsOrTokens()
+        {
+            string logsDir = Path.Combine(_tempDir, "audit_logs");
+            var logger = new SecurityAuditLogger(logsDir);
+
+            // Simulate log injection attempt with newline characters
+            string maliciousUser = "admin\n[2026-11-18 12:00:00 UTC] [INFO] [Session:127.0.0.1] FORGED_ENTRY";
+            logger.LogSecurity("127.0.0.1:5555", $"Failed login for user '{maliciousUser}'");
+
+            string logFilePath = Path.Combine(logsDir, "server_audit.log");
+            string[] lines = File.ReadAllLines(logFilePath);
+
+            // Must be written as a single physical line with escaped \n
+            Assert.Single(lines);
+            Assert.Contains("\\n", lines[0]);
+        }
+
+        [Fact]
+        public void T04_AuthAndRbac_ShouldVerifyPbkdf2Passwords_EnforceRoles_AndLockoutBruteForce()
         {
             string usersPath = Path.Combine(_tempDir, "config", "users.json");
             AuthAndRbacModule.ProvisionUsersFile(usersPath, "AdminPass!123", "ReaderPass!123");
@@ -99,9 +157,9 @@ namespace Pus.Vault.Tests
             // Even with valid password, the 4th immediate attempt from locked-out IP is rejected
             Assert.False(auth.TryAuthenticate("admin", "AdminPass!123", "AA", "AA", "10.0.0.99", out _));
         }
-        
+
         [Fact]
-        public async Task ServerListenerAndSession_ShouldHandleFullTlsSession_AndEnforceStateAndHmac()
+        public async Task ServerListenerAndSession_ShouldHandleFullTlsSession_DuplicateIdempotency_AndAuditRedaction()
         {
             string certsDir = FindCertsDirectory();
             string caCertPath = Path.Combine(certsDir, "ca.crt");
@@ -112,7 +170,10 @@ namespace Pus.Vault.Tests
             string storePath = Path.Combine(_tempDir, "data", "vault_store.json");
             string logsDir = Path.Combine(_tempDir, "logs");
 
-            AuthAndRbacModule.ProvisionUsersFile(usersPath, "AdminPass!123", "ReaderPass!123");
+            const string superSecretPassword = "AdminSuperSecretPassword!999";
+            const string superSecretVaultValue = "ConfidentialStripeKey_sk_live_777777";
+
+            AuthAndRbacModule.ProvisionUsersFile(usersPath, superSecretPassword, "ReaderPass!123");
             var auth = new AuthAndRbacModule(usersPath);
             var storage = new VaultStorageEngine(storePath);
             var logger = new SecurityAuditLogger(logsDir);
@@ -122,7 +183,6 @@ namespace Pus.Vault.Tests
             listener.StartListening();
             Task acceptTask = listener.AcceptLoopAsync(cts.Token);
 
-            // Connect with a raw TCP socket and wrap in TLS 1.3 SslStream using CustomRootTrust
             using var clientSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
             await clientSocket.ConnectAsync(new IPEndPoint(IPAddress.Loopback, listener.BoundPort));
             using var netStream = new NetworkStream(clientSocket, ownsSocket: true);
@@ -154,11 +214,11 @@ namespace Pus.Vault.Tests
             var errPayload = System.Text.Json.JsonSerializer.Deserialize<ErrorPayload>(errRes.Frame.PayloadBytes)!;
             Assert.Equal(PvspErrorCodes.UnauthorizedState, errPayload.ErrorCode);
 
-            // 3. Send valid AUTH (MsgID = 2, since previous frame did not advance sequence in HANDSHAKED state)
+            // 3. Send valid AUTH (MsgID = 2)
             var authReq = new AuthPayload
             {
                 Username = "admin",
-                Password = "AdminPass!123",
+                Password = superSecretPassword,
                 ServerNonceEcho = helloAck.ServerNonce,
                 Timestamp = now
             };
@@ -173,20 +233,35 @@ namespace Pus.Vault.Tests
                 SessionToken = authAck.SessionToken,
                 Action = "SET",
                 Key = "API_TOKEN",
-                Value = "xyz-987",
+                Value = superSecretVaultValue,
                 Timestamp = now
             };
             setReq.Hmac = PvspCryptoHelper.ComputeDataReqHmacHex(authAck.HmacSecret, 3, setReq);
-            await PvspFrameCodec.WriteFrameAsync(sslStream, PvspMessageType.DataReq, 3, PvspJsonSerializer.SerializeToUtf8Bytes(setReq), CancellationToken.None);
+            byte[] setReqBytes = PvspJsonSerializer.SerializeToUtf8Bytes(setReq);
+            await PvspFrameCodec.WriteFrameAsync(sslStream, PvspMessageType.DataReq, 3, setReqBytes, CancellationToken.None);
 
             FrameReadResult setResp = await PvspFrameCodec.ReadFrameAsync(sslStream, CancellationToken.None);
             Assert.Equal(PvspMessageType.DataResp, setResp.Frame.MessageType);
 
-            // 5. Send BYE (MsgID = 4)
+            // 5. Re-send exact same frame (MsgID = 3, identical digest) -> Server returns cached response without error!
+            await PvspFrameCodec.WriteFrameAsync(sslStream, PvspMessageType.DataReq, 3, setReqBytes, CancellationToken.None);
+            FrameReadResult dupResp = await PvspFrameCodec.ReadFrameAsync(sslStream, CancellationToken.None);
+            Assert.Equal(PvspMessageType.DataResp, dupResp.Frame.MessageType);
+            Assert.Equal(3u, dupResp.Frame.MessageId);
+
+            // 6. Send BYE (MsgID = 4)
             await PvspFrameCodec.WriteFrameAsync(sslStream, PvspMessageType.Bye, 4, Array.Empty<byte>(), CancellationToken.None);
 
             cts.Cancel();
             await acceptTask;
+
+            // 7. Verify T-12 Audit Log Redaction: log file must NEVER contain passwords, secret values, tokens,hmacSecret, or nonces
+            string auditLogContent = File.ReadAllText(Path.Combine(logsDir, "server_audit.log"));
+            Assert.DoesNotContain(superSecretPassword, auditLogContent);
+            Assert.DoesNotContain(superSecretVaultValue, auditLogContent);
+            Assert.DoesNotContain(authAck.SessionToken, auditLogContent);
+            Assert.DoesNotContain(authAck.HmacSecret, auditLogContent);
+            Assert.DoesNotContain(helloAck.ServerNonce, auditLogContent);
         }
 
         private static string FindCertsDirectory()

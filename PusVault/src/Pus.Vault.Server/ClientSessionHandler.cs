@@ -114,6 +114,10 @@ namespace Pus.Vault.Server
                     await ProcessValidFrameAsync(readResult.Frame, serverShutdownToken);
                 }
             }
+            catch (OperationCanceledException) when (serverShutdownToken.IsCancellationRequested)
+            {
+                // Clean server shutdown requested
+            }
             catch (Exception ex) when (ex is IOException or ObjectDisposedException)
             {
                 _logger.LogInfo(_clientEndpoint, $"Transport connection closed: {ex.Message}");

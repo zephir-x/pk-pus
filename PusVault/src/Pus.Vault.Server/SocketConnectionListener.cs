@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
@@ -22,6 +23,7 @@ namespace Pus.Vault.Server
         private readonly SecurityAuditLogger _logger;
         private readonly SemaphoreSlim _activeSessionsSemaphore;
         private readonly SemaphoreSlim _handshakeSemaphore;
+        private readonly ConcurrentDictionary<Task, byte> _activeSessionTasks = new();
 
         private readonly TimeSpan _tlsHandshakeTimeout;
         private readonly TimeSpan? _helloTimeout;
@@ -82,7 +84,8 @@ namespace Pus.Vault.Server
         }
 
         /// <summary>
-        /// Main accept loop that accepts raw TCP sockets and spawns isolated asynchronous client session tasks.
+        /// Main accept loop that accepts raw TCP sockets, spawns isolated asynchronous client session tasks,
+        /// and awaits all active session tasks upon graceful server shutdown.
         /// </summary>
         public async Task AcceptLoopAsync(CancellationToken cancellationToken)
         {
@@ -107,8 +110,16 @@ namespace Pus.Vault.Server
                     break;
                 }
 
-                // Do not block the accept thread; handle each client in an isolated background task
-                _ = Task.Run(() => HandleAcceptedSocketAsync(clientSocket, cancellationToken), cancellationToken);
+                // Track each spawned client task so graceful shutdown waits for all sessions to finish logging
+                Task sessionTask = Task.Run(() => HandleAcceptedSocketAsync(clientSocket, cancellationToken));
+                _activeSessionTasks.TryAdd(sessionTask, 0);
+                _ = sessionTask.ContinueWith(t => _activeSessionTasks.TryRemove(t, out _), TaskContinuationOptions.ExecuteSynchronously);
+            }
+
+            // Wait for all active session handlers to complete their cleanup and final log writes
+            if (!_activeSessionTasks.IsEmpty)
+            {
+                await Task.WhenAll(_activeSessionTasks.Keys);
             }
         }
 
@@ -118,7 +129,7 @@ namespace Pus.Vault.Server
             string clientIp = (clientSocket.RemoteEndPoint as IPEndPoint)?.Address.ToString() ?? "unknown";
 
             // Check concurrent session limit immediately
-            if (!await _activeSessionsSemaphore.WaitAsync(TimeSpan.Zero, cancellationToken))
+            if (!await _activeSessionsSemaphore.WaitAsync(TimeSpan.Zero, CancellationToken.None))
             {
                 _logger.LogWarn(remoteEndpoint, "Connection rejected: maximum concurrent sessions limit reached.");
                 clientSocket.Close();
@@ -176,13 +187,25 @@ namespace Pus.Vault.Server
             {
                 _logger.LogWarn(remoteEndpoint, "TLS handshake timed out.");
             }
+            catch (OperationCanceledException)
+            {
+                // Normal server shutdown cancellation
+            }
             catch (Exception ex)
             {
                 _logger.LogError(remoteEndpoint, $"Connection error: {ex.Message}");
             }
             finally
             {
-                _activeSessionsSemaphore.Release();
+                try
+                {
+                    _activeSessionsSemaphore.Release();
+                }
+                catch (ObjectDisposedException)
+                {
+                    // Semaphore was already disposed during graceful or sudden server shutdown
+                }
+
                 try
                 {
                     clientSocket.Close();
