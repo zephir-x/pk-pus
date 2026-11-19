@@ -21,11 +21,28 @@ namespace Pus.Vault.Server
     }
 
     /// <summary>
+    /// Repository abstraction for thread-safe Key-Value secret storage (enables future encryption-at-rest implementations
+    /// without altering the PVSP protocol or session handler).
+    /// </summary>
+    public interface IVaultStorage
+    {
+        StorageOperationStatus SetSecret(string key, string value);
+        StorageOperationStatus TryGetSecret(string key, out string? value);
+        StorageOperationStatus DeleteSecret(string key);
+        StorageOperationStatus TryListKeys(out List<string> keys);
+    }
+
+    /// <summary>
     /// Thread-safe Key-Value secret storage engine with serialized atomic snapshot persistence.
     /// Uses a single critical section (lock) covering in-memory updates, temporary file flush, and atomic File.Move.
     /// </summary>
-    public class VaultStorageEngine
+    public class VaultStorageEngine : IVaultStorage
     {
+        private static readonly JsonSerializerOptions IndentedJsonOptions = new()
+        {
+            WriteIndented = true
+        };
+
         private readonly string _storeFilePath;
         private readonly string _tempFilePath;
         private readonly Dictionary<string, string> _secrets = new(StringComparer.Ordinal);
@@ -158,10 +175,10 @@ namespace Pus.Vault.Server
                 throw new InvalidDataException($"Vault store file '{_storeFilePath}' is empty or corrupted.");
             }
 
-            Dictionary<string, string>? loaded;
+            Dictionary<string, string?>? loaded;
             try
             {
-                loaded = JsonSerializer.Deserialize<Dictionary<string, string>>(json);
+                loaded = JsonSerializer.Deserialize<Dictionary<string, string?>>(json);
             }
             catch (JsonException ex)
             {
@@ -175,6 +192,10 @@ namespace Pus.Vault.Server
 
             foreach (var kvp in loaded)
             {
+                if (kvp.Value == null)
+                {
+                    throw new InvalidDataException($"Vault store file '{_storeFilePath}' contains a null value for key '{kvp.Key}'.");
+                }
                 _secrets[kvp.Key] = kvp.Value;
             }
         }
@@ -185,10 +206,7 @@ namespace Pus.Vault.Server
             {
                 // Keep keys sorted on disk for deterministic snapshots
                 var sortedDict = new SortedDictionary<string, string>(stateToPersist, StringComparer.Ordinal);
-                byte[] jsonBytes = JsonSerializer.SerializeToUtf8Bytes(sortedDict, new JsonSerializerOptions
-                {
-                    WriteIndented = true
-                });
+                byte[] jsonBytes = JsonSerializer.SerializeToUtf8Bytes(sortedDict, IndentedJsonOptions);
 
                 // 1. Write snapshot to temporary file and force OS hardware flush
                 using (var fs = new FileStream(_tempFilePath, FileMode.Create, FileAccess.Write, FileShare.None))

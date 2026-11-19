@@ -1,10 +1,12 @@
 ﻿using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Authentication;
+using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -36,6 +38,7 @@ namespace Pus.Vault.Client
         private readonly int _port;
         private readonly string _caCertPath;
         private readonly TimeSpan _requestTimeout;
+        private readonly TimeSpan _tlsHandshakeTimeout;
         private readonly TimeSpan[] _backoffDelays;
 
         // Single semaphore serializing all request-response cycles over the SslStream
@@ -55,13 +58,18 @@ namespace Pus.Vault.Client
         private string? _cachedPassword;
 
         private int _requestInFlightFlag;
+        private long _lastActivityUtcTicks = DateTime.UtcNow.Ticks;
 
         public bool IsAuthenticated => !string.IsNullOrEmpty(_sessionToken) && _sslStream != null;
         public string AssignedRole => _assignedRole;
-        public DateTime LastActivityUtc { get; private set; } = DateTime.UtcNow;
+        public DateTime LastActivityUtc
+        {
+            get => new DateTime(Interlocked.Read(ref _lastActivityUtcTicks), DateTimeKind.Utc);
+            private set => Interlocked.Exchange(ref _lastActivityUtcTicks, value.ToUniversalTime().Ticks);
+        }
         public bool IsRequestInFlight => Volatile.Read(ref _requestInFlightFlag) == 1;
 
-        // Optional callback for logging reconnect/diagnostic events to the console
+        // Optional callback for structured client diagnostic/session logs
         public Action<string>? OnDiagnosticLog { get; set; }
 
         public PvspClientEngine(
@@ -69,12 +77,14 @@ namespace Pus.Vault.Client
             int port,
             string caCertPath,
             TimeSpan? requestTimeout = null,
-            TimeSpan[]? customBackoffDelays = null)
+            TimeSpan[]? customBackoffDelays = null,
+            TimeSpan? tlsHandshakeTimeout = null)
         {
             _host = host;
             _port = port;
             _caCertPath = caCertPath;
             _requestTimeout = requestTimeout ?? TimeSpan.FromSeconds(5);
+            _tlsHandshakeTimeout = tlsHandshakeTimeout ?? TimeSpan.FromSeconds(10);
             _backoffDelays = customBackoffDelays ?? new[]
             {
                 TimeSpan.FromSeconds(1),
@@ -113,7 +123,7 @@ namespace Pus.Vault.Client
         /// <summary>
         /// Executes a vault CRUD request (SET, GET, LIST, DELETE) signed with canonical HMAC-SHA256.
         /// Automatically reconnects and retries ONLY for idempotent read actions (GET and LIST).
-        /// For SET and DELETE, if the connection drops after sending, returns UnknownMutationOutcome.
+        /// For SET and DELETE, if the connection drops once transmission has started, returns UnknownMutationOutcome.
         /// </summary>
         public async Task<ClientOperationResult> ExecuteDataRequestAsync(
             string action,
@@ -138,6 +148,7 @@ namespace Pus.Vault.Client
                 // If Message ID reached uint32.MaxValue, specification requires re-establishing the session first
                 if (_nextMessageId == uint.MaxValue)
                 {
+                    Log("INFO", "Message ID counter reached uint32.MaxValue. Rotating session via Auto-Reconnect...");
                     bool rotated = await TryAutoReconnectInternalAsync(ct);
                     if (!rotated)
                     {
@@ -149,30 +160,31 @@ namespace Pus.Vault.Client
                     }
                 }
 
-                bool requestBytesSentToWire = false;
+                bool requestWriteStarted = false;
 
                 try
                 {
-                    return await SendDataReqCoreAsync(action, key, value, () => requestBytesSentToWire = true, ct);
+                    return await SendDataReqCoreAsync(action, key, value, () => requestWriteStarted = true, ct);
                 }
                 catch (Exception ex) when (IsTransientNetworkFailure(ex, ct))
                 {
-                    Log($"Connection lost during {action} ({ex.Message}). Starting Auto-Reconnect...");
+                    Log("WARN", $"Connection lost during {action} ({ex.Message}). Starting Auto-Reconnect...");
 
                     bool reconnected = await TryAutoReconnectInternalAsync(ct);
-                    
-                    // If a mutation (SET or DELETE) was already written to the stream before the failure,
-                    // we must NOT silently retry it because the server may have already committed it.
+
+                    // Once a mutation (SET or DELETE) write has begun, we must NOT silently retry it
+                    // because partial/complete bytes may already have reached the server and committed.
                     bool isSafeReadAction = action is "GET" or "LIST";
-                    if (!isSafeReadAction && requestBytesSentToWire)
+                    if (!isSafeReadAction && requestWriteStarted)
                     {
+                        Log("WARN", $"Mutation '{action}' outcome is UNKNOWN after transport drop; skipping automatic retry.");
                         return new ClientOperationResult
                         {
                             IsSuccess = false,
                             IsUnknownMutationOutcome = true,
                             Message = reconnected
-                                ? $"Connection dropped after sending '{action}'. Outcome is UNKNOWN (session was restored, but mutation was not retried; verify with 'get' or 'list')."
-                                : $"Connection dropped after sending '{action}' and Auto-Reconnect failed. Outcome is UNKNOWN."
+                                ? $"Connection dropped after initiating '{action}'. Outcome is UNKNOWN (session was restored, but mutation was not retried; verify with 'get' or 'list')."
+                                : $"Connection dropped after initiating '{action}' and Auto-Reconnect failed. Outcome is UNKNOWN."
                         };
                     }
 
@@ -185,14 +197,15 @@ namespace Pus.Vault.Client
                         };
                     }
 
-                    // Safe to automatically retry GET / LIST (or a mutation that failed before writing to wire)
-                    Log($"Auto-Reconnect succeeded. Retrying safe operation '{action}' in new session...");
+                    // Safe to automatically retry GET / LIST (or a mutation that failed before initiating write)
+                    Log("INFO", $"Auto-Reconnect succeeded. Retrying safe operation '{action}' in new session...");
                     try
                     {
                         return await SendDataReqCoreAsync(action, key, value, () => { }, ct);
                     }
                     catch (Exception retryEx)
                     {
+                        Log("ERROR", $"Operation '{action}' failed after reconnect: {retryEx.Message}");
                         return new ClientOperationResult
                         {
                             IsSuccess = false,
@@ -210,6 +223,7 @@ namespace Pus.Vault.Client
 
         /// <summary>
         /// Sends a PING (0x07) frame and awaits a PONG (0x08) response with the matching Message ID.
+        /// Upon timeout, EOF, or protocol mismatch, closes the broken transport and runs Auto-Reconnect recovery.
         /// </summary>
         public async Task<bool> SendPingAsync(CancellationToken ct = default)
         {
@@ -221,24 +235,43 @@ namespace Pus.Vault.Client
 
                 Volatile.Write(ref _requestInFlightFlag, 1);
 
-                uint msgId = _nextMessageId++;
-                using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                timeoutCts.CancelAfter(_requestTimeout);
+                try
+                {
+                    if (await SendPingCoreAsync(ct))
+                        return true;
 
-                await PvspFrameCodec.WriteFrameAsync(_sslStream, PvspMessageType.Ping, msgId, Array.Empty<byte>(), timeoutCts.Token);
-                LastActivityUtc = DateTime.UtcNow;
+                    Log("WARN", "PING received EOF, malformed frame, or mismatched PONG. Closing transport and starting Auto-Reconnect...");
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    return false;
+                }
+                catch (Exception ex)
+                {
+                    Log("WARN", $"PING failed ({ex.Message}). Closing broken transport and starting Auto-Reconnect...");
+                }
 
-                FrameReadResult resp = await PvspFrameCodec.ReadFrameAsync(_sslStream, timeoutCts.Token);
-                LastActivityUtc = DateTime.UtcNow;
+                // Always tear down a timed-out or broken stream so late PONG frames cannot desynchronize future requests
+                CloseTransportInternal();
 
-                return !resp.IsEof &&
-                       resp.HeaderReadComplete &&
-                       resp.FramingErrorCode == 0 &&
-                       resp.Frame.MessageType == PvspMessageType.Pong &&
-                       resp.Frame.MessageId == msgId;
-            }
-            catch
-            {
+                if (ct.IsCancellationRequested)
+                    return false;
+
+                bool reconnected = await TryAutoReconnectInternalAsync(ct);
+                if (!reconnected)
+                    return false;
+
+                try
+                {
+                    if (await SendPingCoreAsync(ct))
+                        return true;
+                }
+                catch (Exception ex)
+                {
+                    Log("ERROR", $"PING verification failed after Auto-Reconnect: {ex.Message}");
+                }
+
+                CloseTransportInternal();
                 return false;
             }
             finally
@@ -246,6 +279,29 @@ namespace Pus.Vault.Client
                 Volatile.Write(ref _requestInFlightFlag, 0);
                 _ioLock.Release();
             }
+        }
+
+        private async Task<bool> SendPingCoreAsync(CancellationToken ct)
+        {
+            if (_sslStream == null)
+                return false;
+
+            uint msgId = _nextMessageId++;
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeoutCts.CancelAfter(_requestTimeout);
+
+            await PvspFrameCodec.WriteFrameAsync(_sslStream, PvspMessageType.Ping, msgId, Array.Empty<byte>(), timeoutCts.Token);
+            LastActivityUtc = DateTime.UtcNow;
+
+            FrameReadResult resp = await PvspFrameCodec.ReadFrameAsync(_sslStream, timeoutCts.Token);
+            LastActivityUtc = DateTime.UtcNow;
+
+            return !resp.IsEof &&
+                   resp.HeaderReadComplete &&
+                   resp.FramingErrorCode == 0 &&
+                   resp.Frame.MessageType == PvspMessageType.Pong &&
+                   resp.Frame.MessageId == msgId &&
+                   resp.Frame.PayloadLength == 0;
         }
 
         /// <summary>
@@ -263,6 +319,7 @@ namespace Pus.Vault.Client
                         uint msgId = _nextMessageId++;
                         using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
                         await PvspFrameCodec.WriteFrameAsync(_sslStream, PvspMessageType.Bye, msgId, Array.Empty<byte>(), timeoutCts.Token);
+                        Log("INFO", $"Sent BYE (MsgID={msgId}) and closing TLS/TCP session.");
                     }
                     catch
                     {
@@ -283,7 +340,7 @@ namespace Pus.Vault.Client
                 _ioLock.Release();
             }
         }
-        
+
         // DIAGNOSTIC HARNESS METHODS (Only exposed when --diagnostics flag is active)
 
         /// <summary>
@@ -310,6 +367,7 @@ namespace Pus.Vault.Client
                 using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 timeoutCts.CancelAfter(_requestTimeout);
 
+                Log("INFO", $"Sending diagnostic corrupted-HMAC DATA_REQ (MsgID={msgId}).");
                 byte[] payloadBytes = PvspJsonSerializer.SerializeToUtf8Bytes(req);
                 await PvspFrameCodec.WriteFrameAsync(_sslStream, PvspMessageType.DataReq, msgId, payloadBytes, timeoutCts.Token);
 
@@ -347,6 +405,7 @@ namespace Pus.Vault.Client
                 using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 timeoutCts.CancelAfter(_requestTimeout);
 
+                Log("INFO", $"Sending diagnostic expired-timestamp DATA_REQ (MsgID={msgId}).");
                 byte[] payloadBytes = PvspJsonSerializer.SerializeToUtf8Bytes(req);
                 await PvspFrameCodec.WriteFrameAsync(_sslStream, PvspMessageType.DataReq, msgId, payloadBytes, timeoutCts.Token);
 
@@ -362,7 +421,7 @@ namespace Pus.Vault.Client
 
         /// <summary>
         /// Diagnostic test helper: sends a binary header with corrupted Magic Bytes (0x0000 instead of 0x5053)
-        /// to demonstrate server-side 100 ERR_BAD_MAGIC detection.
+        /// while preserving the active Big-Endian Message ID in bytes 4..7 to demonstrate 100 ERR_BAD_MAGIC detection.
         /// </summary>
         public async Task<ClientOperationResult> SendDiagnosticBadMagicAsync(CancellationToken ct = default)
         {
@@ -378,10 +437,13 @@ namespace Pus.Vault.Client
                 badHeader[1] = 0x00; // Invalid Magic Byte 2
                 badHeader[2] = PvspConstants.ProtocolVersion;
                 badHeader[3] = (byte)PvspMessageType.Ping;
+                BinaryPrimitives.WriteUInt32BigEndian(badHeader.AsSpan(4, 4), msgId);
+                BinaryPrimitives.WriteUInt32BigEndian(badHeader.AsSpan(8, 4), 0);
 
                 using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 timeoutCts.CancelAfter(_requestTimeout);
 
+                Log("INFO", $"Sending diagnostic invalid-magic header (MsgID={msgId}).");
                 await _sslStream.WriteAsync(badHeader, timeoutCts.Token);
                 await _sslStream.FlushAsync(timeoutCts.Token);
 
@@ -394,7 +456,7 @@ namespace Pus.Vault.Client
                 _ioLock.Release();
             }
         }
-        
+
         // INTERNAL CONNECTION, HANDSHAKE & AUTO-RECONNECT LOGIC
 
         private async Task<(bool Success, string Message, int ErrorCode)> EstablishSessionInternalAsync(
@@ -414,7 +476,7 @@ namespace Pus.Vault.Client
                 };
 
                 using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                connectCts.CancelAfter(_requestTimeout);
+                connectCts.CancelAfter(_tlsHandshakeTimeout);
                 await _socket.ConnectAsync(new IPEndPoint(targetIp, _port), connectCts.Token);
 
                 // 2. Wrap the raw Socket in NetworkStream and SslStream enforcing TLS 1.3 and Custom CA validation
@@ -432,6 +494,7 @@ namespace Pus.Vault.Client
                 };
 
                 await _sslStream.AuthenticateAsClientAsync(sslOptions, connectCts.Token);
+                Log("INFO", $"TLS 1.3 handshake succeeded (Cipher={_sslStream.NegotiatedCipherSuite}).");
 
                 // Reset per-connection Message ID counter to 1
                 _nextMessageId = 1;
@@ -455,17 +518,17 @@ namespace Pus.Vault.Client
                     helloCts.Token);
 
                 FrameReadResult helloAckResult = await PvspFrameCodec.ReadFrameAsync(_sslStream, helloCts.Token);
-                if (helloAckResult.IsEof || !helloAckResult.HeaderReadComplete)
+                if (helloAckResult.IsEof || !helloAckResult.HeaderReadComplete || helloAckResult.FramingErrorCode != 0)
                 {
                     CloseTransportInternal();
-                    return (false, "Server closed connection during HELLO handshake.", 0);
+                    return (false, "Server closed connection or sent malformed frame during HELLO handshake.", helloAckResult.FramingErrorCode);
                 }
 
                 if (helloAckResult.Frame.MessageType == PvspMessageType.Error)
                 {
-                    var err = JsonSerializer.Deserialize<ErrorPayload>(helloAckResult.Frame.PayloadBytes);
+                    TryDeserializePayload<ErrorPayload>(helloAckResult.Frame.PayloadBytes, out var err);
                     CloseTransportInternal();
-                    return (false, $"HELLO failed ({err?.ErrorCode} {err?.ErrorName}): {err?.Message}", err?.ErrorCode ?? 0);
+                    return (false, $"HELLO failed ({err?.ErrorCode} {err?.ErrorName}): {err?.Message ?? "Malformed error payload."}", err?.ErrorCode ?? 0);
                 }
 
                 if (helloAckResult.Frame.MessageType != PvspMessageType.HelloAck || helloAckResult.Frame.MessageId != helloId)
@@ -474,7 +537,13 @@ namespace Pus.Vault.Client
                     return (false, "Unexpected response type or Message ID during HELLO_ACK.", 0);
                 }
 
-                var helloAck = JsonSerializer.Deserialize<HelloAckPayload>(helloAckResult.Frame.PayloadBytes)!;
+                if (!TryDeserializePayload<HelloAckPayload>(helloAckResult.Frame.PayloadBytes, out var helloAck) ||
+                    string.IsNullOrEmpty(helloAck!.ServerNonce))
+                {
+                    CloseTransportInternal();
+                    Log("ERROR", "Received malformed HELLO_ACK payload from server.");
+                    return (false, "Received malformed HELLO_ACK payload from server.", 0);
+                }
 
                 // 4. Send AUTH (0x03) with MsgID = 2 and serverNonceEcho
                 uint authId = _nextMessageId++;
@@ -497,17 +566,18 @@ namespace Pus.Vault.Client
                     authCts.Token);
 
                 FrameReadResult authAckResult = await PvspFrameCodec.ReadFrameAsync(_sslStream, authCts.Token);
-                if (authAckResult.IsEof || !authAckResult.HeaderReadComplete)
+                if (authAckResult.IsEof || !authAckResult.HeaderReadComplete || authAckResult.FramingErrorCode != 0)
                 {
                     CloseTransportInternal();
-                    return (false, "Server closed connection during AUTH handshake.", 0);
+                    return (false, "Server closed connection or sent malformed frame during AUTH handshake.", authAckResult.FramingErrorCode);
                 }
 
                 if (authAckResult.Frame.MessageType == PvspMessageType.Error)
                 {
-                    var err = JsonSerializer.Deserialize<ErrorPayload>(authAckResult.Frame.PayloadBytes);
+                    TryDeserializePayload<ErrorPayload>(authAckResult.Frame.PayloadBytes, out var err);
                     CloseTransportInternal();
-                    return (false, $"Authentication rejected ({err?.ErrorCode} {err?.ErrorName}): {err?.Message}", err?.ErrorCode ?? 0);
+                    Log("SECURITY", $"Authentication rejected for user '{username}' (Code={err?.ErrorCode ?? 0}).");
+                    return (false, $"Authentication rejected ({err?.ErrorCode} {err?.ErrorName}): {err?.Message ?? "Malformed error payload."}", err?.ErrorCode ?? 0);
                 }
 
                 if (authAckResult.Frame.MessageType != PvspMessageType.AuthAck || authAckResult.Frame.MessageId != authId)
@@ -516,22 +586,34 @@ namespace Pus.Vault.Client
                     return (false, "Unexpected response type or Message ID during AUTH_ACK.", 0);
                 }
 
-                var authAck = JsonSerializer.Deserialize<AuthAckPayload>(authAckResult.Frame.PayloadBytes)!;
+                if (!TryDeserializePayload<AuthAckPayload>(authAckResult.Frame.PayloadBytes, out var authAck) ||
+                    string.IsNullOrEmpty(authAck!.SessionToken) ||
+                    string.IsNullOrEmpty(authAck.HmacSecret) ||
+                    string.IsNullOrEmpty(authAck.Role))
+                {
+                    CloseTransportInternal();
+                    Log("ERROR", "Received malformed AUTH_ACK payload from server.");
+                    return (false, "Received malformed AUTH_ACK payload from server.", 0);
+                }
+
                 _sessionToken = authAck.SessionToken;
                 _hmacSecretBase64 = authAck.HmacSecret;
                 _assignedRole = authAck.Role;
                 LastActivityUtc = DateTime.UtcNow;
 
+                Log("INFO", $"Authenticated as '{username}' (Role={_assignedRole}).");
                 return (true, $"Authenticated as '{username}' (Role: {_assignedRole}).", 0);
             }
             catch (AuthenticationException ex)
             {
                 CloseTransportInternal();
+                Log("SECURITY", $"TLS 1.3 certificate validation failed: {ex.Message}");
                 throw new AuthenticationException($"TLS 1.3 Certificate validation failed: {ex.Message}", ex);
             }
             catch (Exception ex)
             {
                 CloseTransportInternal();
+                Log("ERROR", $"Connection failed: {ex.Message}");
                 return (false, $"Connection failed: {ex.Message}", 0);
             }
         }
@@ -540,7 +622,7 @@ namespace Pus.Vault.Client
             string action,
             string? key,
             string? value,
-            Action onWrittenToWire,
+            Action onWriteStarted,
             CancellationToken ct)
         {
             if (_sslStream == null)
@@ -564,8 +646,10 @@ namespace Pus.Vault.Client
             using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             timeoutCts.CancelAfter(_requestTimeout);
 
+            // Flag transmission as initiated BEFORE writing to SslStream so failures during WriteAsync/FlushAsync
+            // never cause a silent retry of potentially transmitted SET/DELETE mutations.
+            onWriteStarted();
             await PvspFrameCodec.WriteFrameAsync(_sslStream, PvspMessageType.DataReq, msgId, payloadBytes, timeoutCts.Token);
-            onWrittenToWire();
             LastActivityUtc = DateTime.UtcNow;
 
             FrameReadResult respResult = await PvspFrameCodec.ReadFrameAsync(_sslStream, timeoutCts.Token);
@@ -580,9 +664,20 @@ namespace Pus.Vault.Client
 
         private ClientOperationResult ParseServerResponse(FrameReadResult respResult, uint expectedMsgId)
         {
+            if (respResult.IsEof || !respResult.HeaderReadComplete)
+            {
+                CloseTransportInternal();
+                return new ClientOperationResult
+                {
+                    IsSuccess = false,
+                    Message = "Server closed connection without sending a complete response frame."
+                };
+            }
+
             if (respResult.FramingErrorCode != 0)
             {
                 CloseTransportInternal();
+                Log("ERROR", $"Received malformed frame from server (Code={respResult.FramingErrorCode}): {respResult.FramingErrorMessage}");
                 return new ClientOperationResult
                 {
                     IsSuccess = false,
@@ -593,8 +688,20 @@ namespace Pus.Vault.Client
 
             if (respResult.Frame.MessageType == PvspMessageType.Error)
             {
-                var err = JsonSerializer.Deserialize<ErrorPayload>(respResult.Frame.PayloadBytes);
-                int code = err?.ErrorCode ?? PvspErrorCodes.InternalServer;
+                if (!TryDeserializePayload<ErrorPayload>(respResult.Frame.PayloadBytes, out var err))
+                {
+                    CloseTransportInternal();
+                    Log("ERROR", "Received ERROR frame with malformed JSON payload.");
+                    return new ClientOperationResult
+                    {
+                        IsSuccess = false,
+                        ErrorCode = PvspErrorCodes.InternalServer,
+                        ErrorName = PvspErrorCodes.GetName(PvspErrorCodes.InternalServer),
+                        Message = "Received malformed ERROR payload from server."
+                    };
+                }
+
+                int code = err!.ErrorCode != 0 ? err.ErrorCode : PvspErrorCodes.InternalServer;
 
                 if (PvspErrorCodes.ShouldCloseConnection(code))
                 {
@@ -605,13 +712,15 @@ namespace Pus.Vault.Client
                 {
                     IsSuccess = false,
                     ErrorCode = code,
-                    ErrorName = err?.ErrorName ?? PvspErrorCodes.GetName(code),
-                    Message = err?.Message ?? "Unknown server error."
+                    ErrorName = string.IsNullOrEmpty(err.ErrorName) ? PvspErrorCodes.GetName(code) : err.ErrorName,
+                    Message = string.IsNullOrEmpty(err.Message) ? "Unknown server error." : err.Message
                 };
             }
 
             if (respResult.Frame.MessageType != PvspMessageType.DataResp || respResult.Frame.MessageId != expectedMsgId)
             {
+                CloseTransportInternal();
+                Log("ERROR", $"Protocol desynchronization: expected DATA_RESP MsgID={expectedMsgId}, got {respResult.Frame.MessageType} MsgID={respResult.Frame.MessageId}.");
                 return new ClientOperationResult
                 {
                     IsSuccess = false,
@@ -619,11 +728,21 @@ namespace Pus.Vault.Client
                 };
             }
 
-            var dataResp = JsonSerializer.Deserialize<DataRespPayload>(respResult.Frame.PayloadBytes)!;
+            if (!TryDeserializePayload<DataRespPayload>(respResult.Frame.PayloadBytes, out var dataResp))
+            {
+                CloseTransportInternal();
+                Log("ERROR", "Received DATA_RESP frame with malformed JSON payload.");
+                return new ClientOperationResult
+                {
+                    IsSuccess = false,
+                    Message = "Received malformed DATA_RESP payload from server."
+                };
+            }
+
             return new ClientOperationResult
             {
                 IsSuccess = true,
-                Message = $"OK ({dataResp.Action})",
+                Message = $"OK ({dataResp!.Action})",
                 Value = dataResp.Value,
                 Keys = dataResp.Keys
             };
@@ -641,7 +760,7 @@ namespace Pus.Vault.Client
             for (int attempt = 0; attempt < _backoffDelays.Length; attempt++)
             {
                 TimeSpan delay = _backoffDelays[attempt];
-                Log($"Auto-Reconnect attempt {attempt + 1}/{_backoffDelays.Length} in {delay.TotalSeconds:0.#}s...");
+                Log("INFO", $"Auto-Reconnect attempt {attempt + 1}/{_backoffDelays.Length} in {delay.TotalSeconds:0.#}s...");
                 await Task.Delay(delay, ct);
 
                 try
@@ -649,18 +768,35 @@ namespace Pus.Vault.Client
                     var (success, msg, _) = await EstablishSessionInternalAsync(_cachedUsername, _cachedPassword, ct);
                     if (success)
                     {
-                        Log("Auto-Reconnect successful: new TLS 1.3 session established and authenticated.");
+                        Log("INFO", "Auto-Reconnect successful: new TLS 1.3 session established and authenticated.");
                         return true;
                     }
-                    Log($"Auto-Reconnect attempt {attempt + 1} failed: {msg}");
+                    Log("WARN", $"Auto-Reconnect attempt {attempt + 1} failed: {msg}");
                 }
                 catch (Exception ex)
                 {
-                    Log($"Auto-Reconnect attempt {attempt + 1} error: {ex.Message}");
+                    Log("ERROR", $"Auto-Reconnect attempt {attempt + 1} error: {ex.Message}");
                 }
             }
 
             return false;
+        }
+
+        private static bool TryDeserializePayload<T>(byte[] payloadBytes, out T? result) where T : class
+        {
+            result = null;
+            if (payloadBytes == null || payloadBytes.Length == 0)
+                return false;
+
+            try
+            {
+                result = JsonSerializer.Deserialize<T>(payloadBytes);
+                return result != null;
+            }
+            catch (JsonException)
+            {
+                return false;
+            }
         }
 
         private static bool IsTransientNetworkFailure(Exception ex, CancellationToken callerToken)
@@ -700,7 +836,33 @@ namespace Pus.Vault.Client
             _socket = null;
         }
 
-        private void Log(string message) => OnDiagnosticLog?.Invoke(message);
+        private void Log(string level, string message)
+        {
+            var handler = OnDiagnosticLog;
+            if (handler == null)
+                return;
+
+            string timestamp = DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss");
+            string safeMessage = SanitizeLogMessage(message);
+            handler($"[{timestamp} UTC] [{level}] [Session:{_host}:{_port}] {safeMessage}");
+        }
+
+        private static string SanitizeLogMessage(string? input)
+        {
+            if (string.IsNullOrEmpty(input))
+                return string.Empty;
+
+            var sb = new StringBuilder(input.Length);
+            foreach (char c in input)
+            {
+                if (c == '\r') sb.Append("\\r");
+                else if (c == '\n') sb.Append("\\n");
+                else if (c == '\t') sb.Append("\\t");
+                else if (char.IsControl(c)) sb.Append($"\\u{(int)c:x4}");
+                else sb.Append(c);
+            }
+            return sb.ToString();
+        }
 
         public void Dispose()
         {

@@ -1,7 +1,10 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Pus.Vault.Common;
@@ -41,7 +44,7 @@ namespace Pus.Vault.Server
     }
 
     /// <summary>
-    /// Handles user authentication (PBKDF2-HMAC-SHA256), per-account/IP brute-force backoff,
+    /// Handles user authentication (PBKDF2-HMAC-SHA256), bounded per-account/IP brute-force backoff,
     /// session token issuance, and Role-Based Access Control (RBAC).
     /// </summary>
     public class AuthAndRbacModule
@@ -49,9 +52,14 @@ namespace Pus.Vault.Server
         public const string RoleReadWrite = "READ_WRITE";
         public const string RoleReadOnly = "READ_ONLY";
 
+        private const int MaxBackoffTrackerEntries = 4096;
+        private static readonly TimeSpan BackoffEntryTtl = TimeSpan.FromMinutes(15);
+
         private readonly Dictionary<string, UserAccountRecord> _users = new(StringComparer.Ordinal);
-        private readonly Dictionary<string, (int FailedCount, DateTime LockoutUntilUtc)> _backoffTracker = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, BackoffEntry> _backoffTracker = new(StringComparer.Ordinal);
         private readonly object _authLock = new();
+
+        private readonly record struct BackoffEntry(int FailedCount, DateTime LockoutUntilUtc, DateTime LastFailedUtc);
 
         /// <summary>
         /// Loads user accounts from config/users.json. Throws if the file is missing or invalid.
@@ -129,7 +137,7 @@ namespace Pus.Vault.Server
         }
 
         /// <summary>
-        /// Verifies login credentials and serverNonceEcho. Applies exponential backoff per username and client IP.
+        /// Verifies login credentials and exact serverNonceEcho. Applies bounded exponential backoff per username and client IP.
         /// Returns a generic failure status on any mismatch to prevent username enumeration.
         /// </summary>
         public bool TryAuthenticate(
@@ -145,6 +153,8 @@ namespace Pus.Vault.Server
 
             lock (_authLock)
             {
+                PruneBackoffTrackerIfNeeded(now);
+
                 // Check if either the client IP or the target username is currently under brute-force lockout
                 if (IsLockedOut($"ip:{clientIp}", now) || IsLockedOut($"user:{username}", now))
                 {
@@ -152,9 +162,8 @@ namespace Pus.Vault.Server
                 }
             }
 
-            // Verify one-time serverNonceEcho (case-insensitive HEX comparison)
-            bool nonceMatches = !string.IsNullOrEmpty(expectedServerNonce) &&
-                                string.Equals(expectedServerNonce, providedServerNonceEcho, StringComparison.OrdinalIgnoreCase);
+            // Verify one-time serverNonceEcho strictly (exact ordinal match in constant time)
+            bool nonceMatches = VerifyNonceConstantTime(expectedServerNonce, providedServerNonceEcho);
 
             bool passwordValid = false;
             string assignedRole = RoleReadOnly;
@@ -180,6 +189,7 @@ namespace Pus.Vault.Server
                 {
                     RegisterFailedAttempt($"ip:{clientIp}", now);
                     RegisterFailedAttempt($"user:{username}", now);
+                    PruneBackoffTrackerIfNeeded(now);
                     return false;
                 }
 
@@ -219,11 +229,33 @@ namespace Pus.Vault.Server
             return false;
         }
 
+        private static bool VerifyNonceConstantTime(string expected, string provided)
+        {
+            if (string.IsNullOrEmpty(expected) || string.IsNullOrEmpty(provided))
+                return false;
+
+            byte[] expectedBytes = Encoding.UTF8.GetBytes(expected);
+            byte[] providedBytes = Encoding.UTF8.GetBytes(provided);
+            if (expectedBytes.Length != providedBytes.Length)
+                return false;
+
+            return CryptographicOperations.FixedTimeEquals(expectedBytes, providedBytes);
+        }
+
         private bool IsLockedOut(string key, DateTime now)
         {
-            if (_backoffTracker.TryGetValue(key, out var entry) && entry.LockoutUntilUtc > now)
+            if (_backoffTracker.TryGetValue(key, out BackoffEntry entry))
             {
-                return true;
+                if (entry.LockoutUntilUtc > now)
+                {
+                    return true;
+                }
+
+                // Expired stale entry can be cleaned up lazily
+                if (now - entry.LastFailedUtc > BackoffEntryTtl)
+                {
+                    _backoffTracker.Remove(key);
+                }
             }
 
             return false;
@@ -231,8 +263,12 @@ namespace Pus.Vault.Server
 
         private void RegisterFailedAttempt(string key, DateTime now)
         {
-            _backoffTracker.TryGetValue(key, out var current);
-            int nextCount = current.FailedCount + 1;
+            int nextCount = 1;
+            if (_backoffTracker.TryGetValue(key, out BackoffEntry current) &&
+                (current.LockoutUntilUtc > now || now - current.LastFailedUtc <= BackoffEntryTtl))
+            {
+                nextCount = current.FailedCount + 1;
+            }
 
             // Apply progressive lockout after 3 failed attempts across connections (2s, 4s, 8s, max 30s)
             DateTime lockoutUntil = DateTime.MinValue;
@@ -242,7 +278,34 @@ namespace Pus.Vault.Server
                 lockoutUntil = now.AddSeconds(delaySeconds);
             }
 
-            _backoffTracker[key] = (nextCount, lockoutUntil);
+            _backoffTracker[key] = new BackoffEntry(nextCount, lockoutUntil, now);
+        }
+
+        private void PruneBackoffTrackerIfNeeded(DateTime now)
+        {
+            if (_backoffTracker.Count < MaxBackoffTrackerEntries)
+                return;
+
+            // First remove expired entries past TTL
+            List<string> expiredKeys = _backoffTracker
+                .Where(kvp => kvp.Value.LockoutUntilUtc <= now && now - kvp.Value.LastFailedUtc > BackoffEntryTtl)
+                .Select(kvp => kvp.Key)
+                .ToList();
+
+            foreach (string key in expiredKeys)
+            {
+                _backoffTracker.Remove(key);
+            }
+
+            // If still over capacity under a distributed spray attack, evict the oldest entries
+            if (_backoffTracker.Count >= MaxBackoffTrackerEntries)
+            {
+                int toEvict = (_backoffTracker.Count - MaxBackoffTrackerEntries) + (MaxBackoffTrackerEntries / 4);
+                foreach (string key in _backoffTracker.OrderBy(kvp => kvp.Value.LastFailedUtc).Take(toEvict).Select(kvp => kvp.Key).ToList())
+                {
+                    _backoffTracker.Remove(key);
+                }
+            }
         }
     }
 }

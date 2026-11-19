@@ -202,8 +202,9 @@ namespace Pus.Vault.Common
                 {
                     if (!allowedFields.Contains(prop.Name))
                     {
+                        // Never reflect raw untrusted field names back into ERROR frames
                         errorCode = PvspErrorCodes.InvalidPayload;
-                        errorMessage = $"Unknown JSON field: '{prop.Name}'.";
+                        errorMessage = "Payload contains an unknown JSON field.";
                         return false;
                     }
 

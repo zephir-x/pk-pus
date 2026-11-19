@@ -30,11 +30,12 @@ namespace Pus.Vault.Common
         }
 
         /// <summary>
-        /// Generates a random sessionToken (UUID v4 backed by CSPRNG, 128-bit entropy).
+        /// Generates a cryptographically random sessionToken (32 CSPRNG bytes = 256-bit entropy, 64 lowercase HEX chars).
         /// </summary>
         public static string GenerateSessionToken()
         {
-            return Guid.NewGuid().ToString("D");
+            byte[] tokenBytes = RandomNumberGenerator.GetBytes(32);
+            return Convert.ToHexString(tokenBytes).ToLowerInvariant();
         }
 
         /// <summary>
@@ -262,7 +263,7 @@ namespace Pus.Vault.Common
             if (!File.Exists(caCertPath))
                 return false;
 
-            var serverCert = new X509Certificate2(certificate);
+            using var serverCert = new X509Certificate2(certificate);
 
             // Check that the certificate contains the Extended Key Usage (EKU) for Server Authentication (serverAuth)
             bool hasServerAuthEku = false;

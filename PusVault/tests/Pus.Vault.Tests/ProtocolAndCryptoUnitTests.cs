@@ -57,6 +57,28 @@ namespace Pus.Vault.Tests
         }
 
         [Fact]
+        public void Priority2_CryptoHelper_ShouldGenerate256BitSessionTokens_Nonces_AndHmacSecrets()
+        {
+            string token1 = PvspCryptoHelper.GenerateSessionToken();
+            string token2 = PvspCryptoHelper.GenerateSessionToken();
+
+            // 32 CSPRNG bytes = 64 lowercase HEX chars (256-bit entropy)
+            Assert.Equal(64, token1.Length);
+            Assert.Equal(64, token2.Length);
+            Assert.NotEqual(token1, token2);
+            Assert.Matches("^[0-9a-f]{64}$", token1);
+
+            string nonce1 = PvspCryptoHelper.GenerateServerNonceHex();
+            string nonce2 = PvspCryptoHelper.GenerateServerNonceHex();
+            Assert.Equal(32, nonce1.Length);
+            Assert.NotEqual(nonce1, nonce2);
+            Assert.Matches("^[0-9A-F]{32}$", nonce1);
+
+            byte[] hmacKeyBytes = Convert.FromBase64String(PvspCryptoHelper.GenerateHmacSecretBase64());
+            Assert.Equal(32, hmacKeyBytes.Length);
+        }
+
+        [Fact]
         public async Task T07_FrameCodec_ShouldHandleFragmentedTcpStream_PartialReads()
         {
             // Test T-07: Send a 56-byte HELLO frame in tiny 3-byte chunks and verify ReadExactly reassembles it
@@ -138,10 +160,13 @@ namespace Pus.Vault.Tests
             Assert.False(PvspJsonSerializer.TryParseStrictJsonObject(brokenJson, allowed, required, out _, out int errCode2, out _));
             Assert.Equal(PvspErrorCodes.InvalidJson, errCode2);
 
-            // 3. Unknown field in JSON -> 106 ERR_INVALID_PAYLOAD
-            byte[] unknownFieldJson = Encoding.UTF8.GetBytes("{\"clientName\":\"Pus\",\"timestamp\":123,\"extraField\":1}");
-            Assert.False(PvspJsonSerializer.TryParseStrictJsonObject(unknownFieldJson, allowed, required, out _, out int errCode3, out _));
+            // 3. Unknown field in JSON (including oversized untrusted name) -> 106 ERR_INVALID_PAYLOAD without reflecting field name
+            string oversizedField = "extraField_" + new string('X', 700);
+            byte[] unknownFieldJson = Encoding.UTF8.GetBytes($"{{\"clientName\":\"Pus\",\"timestamp\":123,\"{oversizedField}\":1}}");
+            Assert.False(PvspJsonSerializer.TryParseStrictJsonObject(unknownFieldJson, allowed, required, out _, out int errCode3, out string errMsg3));
             Assert.Equal(PvspErrorCodes.InvalidPayload, errCode3);
+            Assert.DoesNotContain("extraField_", errMsg3);
+            Assert.True(Encoding.UTF8.GetByteCount(errMsg3) <= PvspConstants.MaxErrorMessageBytes);
 
             // 4. Duplicate key in JSON object -> 106 ERR_INVALID_PAYLOAD
             byte[] duplicateKeyJson = Encoding.UTF8.GetBytes("{\"clientName\":\"Pus\",\"clientName\":\"Evil\",\"timestamp\":123}");
@@ -160,42 +185,67 @@ namespace Pus.Vault.Tests
         }
 
         [Fact]
-        public void T03_CustomCaValidator_ShouldRejectUntrustedCa_WrongSan_AndMissingServerAuthEku()
+        public void T03_CustomCaValidator_ShouldAcceptValidCert_AndRejectUntrustedCa_WrongSan_AndMissingServerAuthEku()
         {
             string tempDir = Path.Combine(Path.GetTempPath(), "pus_cert_test_" + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(tempDir);
 
             try
             {
-                // Generate an untrusted rogue Root CA in memory
+                // Generate Trusted Root CA and a separate Rogue Root CA
+                using RSA trustedCaKey = RSA.Create(2048);
+                var trustedCaReq = new CertificateRequest("CN=Trusted_Vault_CA", trustedCaKey, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+                trustedCaReq.CertificateExtensions.Add(new X509BasicConstraintsExtension(true, false, 0, true));
+                trustedCaReq.CertificateExtensions.Add(new X509KeyUsageExtension(X509KeyUsageFlags.KeyCertSign | X509KeyUsageFlags.CrlSign, true));
+                using X509Certificate2 trustedCaCert = trustedCaReq.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(30));
+
+                string trustedCaPath = Path.Combine(tempDir, "trusted_ca.crt");
+                File.WriteAllText(trustedCaPath, trustedCaCert.ExportCertificatePem());
+
                 using RSA rogueCaKey = RSA.Create(2048);
                 var rogueCaReq = new CertificateRequest("CN=Rogue_CA", rogueCaKey, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
                 rogueCaReq.CertificateExtensions.Add(new X509BasicConstraintsExtension(true, false, 0, true));
+                rogueCaReq.CertificateExtensions.Add(new X509KeyUsageExtension(X509KeyUsageFlags.KeyCertSign | X509KeyUsageFlags.CrlSign, true));
                 using X509Certificate2 rogueCaCert = rogueCaReq.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(30));
 
-                string rogueCaPath = Path.Combine(tempDir, "rogue_ca.crt");
-                File.WriteAllText(rogueCaPath, rogueCaCert.ExportCertificatePem());
+                // 1. Valid server certificate signed by Trusted CA with EKU serverAuth (1.3.6.1.5.5.7.3.1) -> ACCEPT
+                using RSA validKey = RSA.Create(2048);
+                var validReq = new CertificateRequest("CN=localhost", validKey, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+                validReq.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(new OidCollection { new Oid("1.3.6.1.5.5.7.3.1") }, false));
+                using X509Certificate2 validServerCert = validReq.Create(
+                    trustedCaCert, DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(10), Guid.NewGuid().ToByteArray());
 
-                // Generate a server certificate WITHOUT serverAuth EKU (only clientAuth 1.3.6.1.5.5.7.3.2)
-                using RSA serverKey = RSA.Create(2048);
-                var serverReq = new CertificateRequest("CN=localhost", serverKey, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
-                var ekuOids = new OidCollection { new Oid("1.3.6.1.5.5.7.3.2") }; // clientAuth only!
-                serverReq.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(ekuOids, false));
-                using X509Certificate2 certWithoutServerAuth = serverReq.Create(
-                    rogueCaCert,
-                    DateTimeOffset.UtcNow.AddDays(-1),
-                    DateTimeOffset.UtcNow.AddDays(10),
-                    Guid.NewGuid().ToByteArray());
+                // 2. Server certificate signed by Rogue CA (with valid serverAuth EKU) -> REJECT (untrusted CA)
+                using RSA rogueServerKey = RSA.Create(2048);
+                var rogueServerReq = new CertificateRequest("CN=localhost", rogueServerKey, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+                rogueServerReq.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(new OidCollection { new Oid("1.3.6.1.5.5.7.3.1") }, false));
+                using X509Certificate2 rogueSignedCert = rogueServerReq.Create(
+                    rogueCaCert, DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(10), Guid.NewGuid().ToByteArray());
+
+                // 3. Server certificate signed by Trusted CA WITHOUT serverAuth EKU (only clientAuth 1.3.6.1.5.5.7.3.2) -> REJECT
+                using RSA noServerAuthKey = RSA.Create(2048);
+                var noServerAuthReq = new CertificateRequest("CN=localhost", noServerAuthKey, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+                noServerAuthReq.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(new OidCollection { new Oid("1.3.6.1.5.5.7.3.2") }, false));
+                using X509Certificate2 certWithoutServerAuth = noServerAuthReq.Create(
+                    trustedCaCert, DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(10), Guid.NewGuid().ToByteArray());
 
                 using var chain = new X509Chain();
 
-                // 1. Reject when RemoteCertificateNameMismatch is flagged (SAN / hostname mismatch)
-                Assert.False(PvspCryptoHelper.ValidateServerCertificateCustomCa(
-                    certWithoutServerAuth, chain, SslPolicyErrors.RemoteCertificateNameMismatch, rogueCaPath));
+                // Valid chain against trusted CA (RemoteCertificateChainErrors is normal for custom CA not in OS trust store)
+                Assert.True(PvspCryptoHelper.ValidateServerCertificateCustomCa(
+                    validServerCert, chain, SslPolicyErrors.RemoteCertificateChainErrors, trustedCaPath));
 
-                // 2. Reject when certificate lacks EKU serverAuth (1.3.6.1.5.5.7.3.1)
+                // Untrusted CA: rogue-signed certificate validated against trustedCaPath MUST fail
                 Assert.False(PvspCryptoHelper.ValidateServerCertificateCustomCa(
-                    certWithoutServerAuth, chain, SslPolicyErrors.None, rogueCaPath));
+                    rogueSignedCert, chain, SslPolicyErrors.RemoteCertificateChainErrors, trustedCaPath));
+
+                // Wrong SAN / hostname mismatch MUST fail even for an otherwise valid trusted certificate
+                Assert.False(PvspCryptoHelper.ValidateServerCertificateCustomCa(
+                    validServerCert, chain, SslPolicyErrors.RemoteCertificateNameMismatch, trustedCaPath));
+
+                // Missing serverAuth EKU MUST fail even when signed by trusted CA
+                Assert.False(PvspCryptoHelper.ValidateServerCertificateCustomCa(
+                    certWithoutServerAuth, chain, SslPolicyErrors.RemoteCertificateChainErrors, trustedCaPath));
             }
             finally
             {

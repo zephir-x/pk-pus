@@ -19,7 +19,7 @@ namespace Pus.Vault.Server
         private readonly int _port;
         private readonly X509Certificate2 _serverCertificate;
         private readonly AuthAndRbacModule _authModule;
-        private readonly VaultStorageEngine _storageEngine;
+        private readonly IVaultStorage _storageEngine;
         private readonly SecurityAuditLogger _logger;
         private readonly SemaphoreSlim _activeSessionsSemaphore;
         private readonly SemaphoreSlim _handshakeSemaphore;
@@ -29,6 +29,7 @@ namespace Pus.Vault.Server
         private readonly TimeSpan? _helloTimeout;
         private readonly TimeSpan? _authTimeout;
         private readonly TimeSpan? _idleTimeout;
+        private readonly Action<string, double>? _onDataReqCompleted;
 
         private Socket? _listenSocket;
 
@@ -39,14 +40,15 @@ namespace Pus.Vault.Server
             string serverCertPath,
             string serverKeyPath,
             AuthAndRbacModule authModule,
-            VaultStorageEngine storageEngine,
+            IVaultStorage storageEngine,
             SecurityAuditLogger logger,
             int maxConcurrentSessions = 64,
             int maxConcurrentHandshakes = 32,
             TimeSpan? tlsHandshakeTimeout = null,
             TimeSpan? helloTimeout = null,
             TimeSpan? authTimeout = null,
-            TimeSpan? idleTimeout = null)
+            TimeSpan? idleTimeout = null,
+            Action<string, double>? onDataReqCompleted = null)
         {
             _port = port;
             _authModule = authModule;
@@ -59,6 +61,7 @@ namespace Pus.Vault.Server
             _helloTimeout = helloTimeout;
             _authTimeout = authTimeout;
             _idleTimeout = idleTimeout;
+            _onDataReqCompleted = onDataReqCompleted;
 
             // Load the server's X.509 PEM certificate and private key
             _serverCertificate = X509Certificate2.CreateFromPemFile(serverCertPath, serverKeyPath);
@@ -142,13 +145,13 @@ namespace Pus.Vault.Server
                 using var networkStream = new NetworkStream(clientSocket, ownsSocket: true);
                 using var sslStream = new SslStream(networkStream, leaveInnerStreamOpen: false);
 
-                // Enforce concurrent TLS handshake limit and 10-second TLS handshake deadline
-                await _handshakeSemaphore.WaitAsync(cancellationToken);
+                // Enforce concurrent TLS handshake limit AND a strict total deadline covering both queue wait and TLS handshake
+                using var handshakeCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                handshakeCts.CancelAfter(_tlsHandshakeTimeout);
+
+                await _handshakeSemaphore.WaitAsync(handshakeCts.Token);
                 try
                 {
-                    using var handshakeCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                    handshakeCts.CancelAfter(_tlsHandshakeTimeout);
-
                     var sslOptions = new SslServerAuthenticationOptions
                     {
                         ServerCertificate = _serverCertificate,
@@ -175,7 +178,8 @@ namespace Pus.Vault.Server
                     _logger,
                     _helloTimeout,
                     _authTimeout,
-                    _idleTimeout);
+                    _idleTimeout,
+                    _onDataReqCompleted);
 
                 await sessionHandler.RunSessionAsync(cancellationToken);
             }

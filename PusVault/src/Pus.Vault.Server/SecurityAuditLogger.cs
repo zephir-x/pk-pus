@@ -1,12 +1,13 @@
 ﻿using System;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace Pus.Vault.Server
 {
     /// <summary>
     /// Thread-safe audit and diagnostic logger that writes structured UTC logs to the console and a local file.
-    /// Sanitizes user-supplied strings to prevent log injection and never logs sensitive secrets or passwords.
+    /// Sanitizes user-supplied strings to prevent log injection and ANSI escape attacks, and never logs secrets or passwords.
     /// </summary>
     public class SecurityAuditLogger
     {
@@ -39,17 +40,42 @@ namespace Pus.Vault.Server
             WriteEntry("ERROR", sessionEndpoint, message);
 
         /// <summary>
-        /// Escapes newline and control characters from untrusted input so an attacker cannot forge fake log lines.
+        /// Escapes newlines, tabs, and all Unicode/ASCII control characters (including ANSI ESC sequences)
+        /// from untrusted input so an attacker cannot forge log lines or corrupt operator terminals.
         /// </summary>
         public static string Sanitize(string? input)
         {
             if (string.IsNullOrEmpty(input))
                 return "<empty>";
 
-            return input
-                .Replace("\r", "\\r")
-                .Replace("\n", "\\n")
-                .Replace("\t", "\\t");
+            var sb = new StringBuilder(input.Length);
+            foreach (char c in input)
+            {
+                switch (c)
+                {
+                    case '\r':
+                        sb.Append("\\r");
+                        break;
+                    case '\n':
+                        sb.Append("\\n");
+                        break;
+                    case '\t':
+                        sb.Append("\\t");
+                        break;
+                    default:
+                        if (char.IsControl(c))
+                        {
+                            sb.Append($"\\u{(int)c:x4}");
+                        }
+                        else
+                        {
+                            sb.Append(c);
+                        }
+                        break;
+                }
+            }
+
+            return sb.ToString();
         }
 
         private void WriteEntry(string level, string sessionEndpoint, string message)

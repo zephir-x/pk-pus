@@ -1,6 +1,9 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
+using System.Security.Cryptography;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Pus.Vault.Common;
@@ -9,7 +12,7 @@ namespace Pus.Vault.Server
 {
     /// <summary>
     /// Manages the stateful lifecycle of a single connected client session over an authenticated TLS 1.3 stream.
-    /// Enforces the PVSP state machine, read deadlines, anti-replay rules, sliding-window rate limits, and RBAC.
+    /// Enforces the PVSP state machine, absolute phase deadlines, anti-replay rules, sliding-window rate limits, and RBAC.
     /// </summary>
     public class ClientSessionHandler
     {
@@ -23,8 +26,9 @@ namespace Pus.Vault.Server
         private readonly string _clientEndpoint;
         private readonly string _clientIp;
         private readonly AuthAndRbacModule _authModule;
-        private readonly VaultStorageEngine _storageEngine;
+        private readonly IVaultStorage _storageEngine;
         private readonly SecurityAuditLogger _logger;
+        private readonly Action<string, double>? _onDataReqCompleted;
 
         // Configurable timeouts (defaulting to specification values: 10s HELLO, 15s AUTH, 60s Idle)
         private readonly TimeSpan _helloTimeout;
@@ -33,14 +37,18 @@ namespace Pus.Vault.Server
 
         // Session state fields
         private PvspSessionState _state = PvspSessionState.TlsConnected;
+        private DateTime _phaseDeadlineUtc;
         private string _serverNonce = string.Empty;
         private int _failedAuthAttemptsInSession;
         private AuthenticatedSessionInfo? _authenticatedSession;
 
-        // Sequence number and duplicate detection state
+        // Strictly monotonic sequence number state
         private uint _lastAcceptedMessageId;
-        private byte[]? _lastRequestDigest;
-        private byte[]? _lastResponseFrameBytes;
+
+        // Isolated deduplication cache strictly for the most recent authenticated DATA_REQ
+        private uint _lastDataReqMessageId;
+        private byte[]? _lastDataReqDigest;
+        private byte[]? _lastDataReqResponseFrameBytes;
 
         // Sliding window rate limiter: max 20 DATA_REQ per 10 seconds
         private readonly Queue<DateTime> _dataReqTimestamps = new();
@@ -50,11 +58,12 @@ namespace Pus.Vault.Server
             string clientEndpoint,
             string clientIp,
             AuthAndRbacModule authModule,
-            VaultStorageEngine storageEngine,
+            IVaultStorage storageEngine,
             SecurityAuditLogger logger,
             TimeSpan? helloTimeout = null,
             TimeSpan? authTimeout = null,
-            TimeSpan? idleTimeout = null)
+            TimeSpan? idleTimeout = null,
+            Action<string, double>? onDataReqCompleted = null)
         {
             _stream = stream;
             _clientEndpoint = clientEndpoint;
@@ -62,6 +71,7 @@ namespace Pus.Vault.Server
             _authModule = authModule;
             _storageEngine = storageEngine;
             _logger = logger;
+            _onDataReqCompleted = onDataReqCompleted;
 
             _helloTimeout = helloTimeout ?? TimeSpan.FromSeconds(10);
             _authTimeout = authTimeout ?? TimeSpan.FromSeconds(15);
@@ -70,18 +80,28 @@ namespace Pus.Vault.Server
 
         /// <summary>
         /// Main loop processing incoming PVSP frames for the connected client until session closure.
+        /// Enforces absolute deadlines for TLS_CONNECTED (HELLO) and HANDSHAKED (AUTH) phases,
+        /// and resets the AUTHENTICATED idle deadline only upon receiving a valid authenticated frame.
         /// </summary>
         public async Task RunSessionAsync(CancellationToken serverShutdownToken)
         {
             _logger.LogInfo(_clientEndpoint, "Session entered TLS_CONNECTED state.");
+            _phaseDeadlineUtc = DateTime.UtcNow + _helloTimeout;
 
             try
             {
                 while (_state != PvspSessionState.Closed && !serverShutdownToken.IsCancellationRequested)
                 {
-                    TimeSpan currentReadDeadline = GetCurrentReadDeadline();
+                    TimeSpan remaining = _phaseDeadlineUtc - DateTime.UtcNow;
+                    if (remaining <= TimeSpan.Zero)
+                    {
+                        _logger.LogWarn(_clientEndpoint, $"Session deadline exceeded in state {_state}.");
+                        await SendErrorAndCloseAsync(0, PvspErrorCodes.Timeout, $"Session deadline exceeded in state {_state}.");
+                        break;
+                    }
+
                     using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(serverShutdownToken);
-                    timeoutCts.CancelAfter(currentReadDeadline);
+                    timeoutCts.CancelAfter(remaining);
 
                     FrameReadResult readResult;
                     try
@@ -90,8 +110,8 @@ namespace Pus.Vault.Server
                     }
                     catch (OperationCanceledException) when (!serverShutdownToken.IsCancellationRequested)
                     {
-                        _logger.LogWarn(_clientEndpoint, $"Session timed out in state {_state} after {currentReadDeadline.TotalSeconds}s.");
-                        await SendErrorAndCloseAsync(0, PvspErrorCodes.Timeout, $"Session deadline ({currentReadDeadline.TotalSeconds}s) exceeded in state {_state}.");
+                        _logger.LogWarn(_clientEndpoint, $"Session timed out in state {_state}.");
+                        await SendErrorAndCloseAsync(0, PvspErrorCodes.Timeout, $"Session deadline exceeded in state {_state}.");
                         break;
                     }
 
@@ -129,17 +149,11 @@ namespace Pus.Vault.Server
             finally
             {
                 _authenticatedSession = null;
+                ClearDuplicateCache();
                 _state = PvspSessionState.Closed;
                 _logger.LogInfo(_clientEndpoint, "Session closed and resources released.");
             }
         }
-
-        private TimeSpan GetCurrentReadDeadline() => _state switch
-        {
-            PvspSessionState.TlsConnected => _helloTimeout,
-            PvspSessionState.Handshaked => _authTimeout,
-            _ => _idleTimeout
-        };
 
         private async Task ProcessValidFrameAsync(PvspFrame frame, CancellationToken ct)
         {
@@ -148,11 +162,12 @@ namespace Pus.Vault.Server
             {
                 if (frame.PayloadLength != 0)
                 {
+                    ConsumeNonClosingErrorSequenceId(frame.MessageId);
                     await SendErrorAsync(frame.MessageId, PvspErrorCodes.InvalidPayload, "BYE frame must have an empty payload (PayloadLength = 0).", ct);
                     return;
                 }
 
-                if (!ValidateAndAdvanceSequenceId(frame, isDataReq: false, out bool isDuplicate, out int seqErrCode, out string seqErrMsg))
+                if (!ValidateAndAdvanceSequenceId(frame, isDataReq: false, out _, out _, out int seqErrCode, out string seqErrMsg))
                 {
                     await SendErrorAndCloseAsync(frame.MessageId, seqErrCode, seqErrMsg);
                     return;
@@ -169,6 +184,7 @@ namespace Pus.Vault.Server
                 case PvspSessionState.TlsConnected:
                     if (frame.MessageType != PvspMessageType.Hello)
                     {
+                        ConsumeNonClosingErrorSequenceId(frame.MessageId);
                         await SendErrorAsync(frame.MessageId, PvspErrorCodes.UnauthorizedState, "Client must send HELLO (0x01) first in TLS_CONNECTED state.", ct);
                         return;
                     }
@@ -178,6 +194,7 @@ namespace Pus.Vault.Server
                 case PvspSessionState.Handshaked:
                     if (frame.MessageType != PvspMessageType.Auth)
                     {
+                        ConsumeNonClosingErrorSequenceId(frame.MessageId);
                         await SendErrorAsync(frame.MessageId, PvspErrorCodes.UnauthorizedState, "Client must complete AUTH handshake before sending other frames.", ct);
                         return;
                     }
@@ -195,6 +212,7 @@ namespace Pus.Vault.Server
                     }
                     else
                     {
+                        ConsumeNonClosingErrorSequenceId(frame.MessageId);
                         await SendErrorAsync(frame.MessageId, PvspErrorCodes.UnauthorizedState, $"Message type {frame.MessageType} is not allowed in AUTHENTICATED state.", ct);
                     }
                     break;
@@ -205,12 +223,14 @@ namespace Pus.Vault.Server
         {
             if (frame.PayloadLength == 0)
             {
+                ConsumeNonClosingErrorSequenceId(frame.MessageId);
                 await SendErrorAsync(frame.MessageId, PvspErrorCodes.InvalidPayload, "HELLO requires a non-empty JSON payload.", ct);
                 return;
             }
 
             if (!PvspJsonSerializer.TryParseStrictJsonObject(frame.PayloadBytes, HelloFields, HelloFields, out var fields, out int errCode, out string errMsg))
             {
+                ConsumeNonClosingErrorSequenceId(frame.MessageId);
                 await SendErrorAsync(frame.MessageId, errCode, errMsg, ct);
                 return;
             }
@@ -218,11 +238,12 @@ namespace Pus.Vault.Server
             if (!PvspJsonSerializer.TryGetStringField(fields, "clientName", PvspConstants.MaxClientNameBytes, allowEmpty: false, out string clientName, out string fieldErr) ||
                 !PvspJsonSerializer.TryGetInt64Field(fields, "timestamp", out long timestamp, out fieldErr))
             {
+                ConsumeNonClosingErrorSequenceId(frame.MessageId);
                 await SendErrorAsync(frame.MessageId, PvspErrorCodes.InvalidPayload, fieldErr, ct);
                 return;
             }
 
-            if (!ValidateAndAdvanceSequenceId(frame, isDataReq: false, out _, out int seqErrCode, out string seqErrMsg))
+            if (!ValidateAndAdvanceSequenceId(frame, isDataReq: false, out _, out _, out int seqErrCode, out string seqErrMsg))
             {
                 await SendErrorAndCloseAsync(frame.MessageId, seqErrCode, seqErrMsg);
                 return;
@@ -237,6 +258,7 @@ namespace Pus.Vault.Server
 
             _serverNonce = PvspCryptoHelper.GenerateServerNonceHex();
             _state = PvspSessionState.Handshaked;
+            _phaseDeadlineUtc = DateTime.UtcNow + _authTimeout;
 
             var ackPayload = new HelloAckPayload
             {
@@ -254,26 +276,29 @@ namespace Pus.Vault.Server
         {
             if (frame.PayloadLength == 0)
             {
+                ConsumeNonClosingErrorSequenceId(frame.MessageId);
                 await SendErrorAsync(frame.MessageId, PvspErrorCodes.InvalidPayload, "AUTH requires a non-empty JSON payload.", ct);
                 return;
             }
 
             if (!PvspJsonSerializer.TryParseStrictJsonObject(frame.PayloadBytes, AuthFields, AuthFields, out var fields, out int errCode, out string errMsg))
             {
+                ConsumeNonClosingErrorSequenceId(frame.MessageId);
                 await SendErrorAsync(frame.MessageId, errCode, errMsg, ct);
                 return;
             }
 
             if (!PvspJsonSerializer.TryGetStringField(fields, "username", PvspConstants.MaxUsernameBytes, allowEmpty: false, out string username, out string fieldErr) ||
                 !PvspJsonSerializer.TryGetStringField(fields, "password", PvspConstants.MaxPasswordBytes, allowEmpty: false, out string password, out fieldErr) ||
-                !PvspJsonSerializer.TryGetStringField(fields, "serverNonceEcho", 64, allowEmpty: false, out string nonceEcho, out fieldErr) ||
+                !PvspJsonSerializer.TryGetStringField(fields, "serverNonceEcho", 32, allowEmpty: false, out string nonceEcho, out fieldErr) ||
                 !PvspJsonSerializer.TryGetInt64Field(fields, "timestamp", out long timestamp, out fieldErr))
             {
+                ConsumeNonClosingErrorSequenceId(frame.MessageId);
                 await SendErrorAsync(frame.MessageId, PvspErrorCodes.InvalidPayload, fieldErr, ct);
                 return;
             }
 
-            if (!ValidateAndAdvanceSequenceId(frame, isDataReq: false, out _, out int seqErrCode, out string seqErrMsg))
+            if (!ValidateAndAdvanceSequenceId(frame, isDataReq: false, out _, out _, out int seqErrCode, out string seqErrMsg))
             {
                 await SendErrorAndCloseAsync(frame.MessageId, seqErrCode, seqErrMsg);
                 return;
@@ -306,6 +331,7 @@ namespace Pus.Vault.Server
             _serverNonce = string.Empty;
             _authenticatedSession = sessionInfo;
             _state = PvspSessionState.Authenticated;
+            _phaseDeadlineUtc = DateTime.UtcNow + _idleTimeout;
 
             var authAck = new AuthAckPayload
             {
@@ -323,31 +349,37 @@ namespace Pus.Vault.Server
         {
             if (frame.PayloadLength != 0)
             {
+                ConsumeNonClosingErrorSequenceId(frame.MessageId);
                 await SendErrorAsync(frame.MessageId, PvspErrorCodes.InvalidPayload, "PING frame must have an empty payload (PayloadLength = 0).", ct);
                 return;
             }
 
-            if (!ValidateAndAdvanceSequenceId(frame, isDataReq: false, out _, out int seqErrCode, out string seqErrMsg))
+            if (!ValidateAndAdvanceSequenceId(frame, isDataReq: false, out _, out _, out int seqErrCode, out string seqErrMsg))
             {
                 await SendErrorAndCloseAsync(frame.MessageId, seqErrCode, seqErrMsg);
                 return;
             }
 
+            _phaseDeadlineUtc = DateTime.UtcNow + _idleTimeout;
             await PvspFrameCodec.WriteFrameAsync(_stream, PvspMessageType.Pong, frame.MessageId, Array.Empty<byte>(), ct);
             _logger.LogInfo(_clientEndpoint, $"Rcv MsgID={frame.MessageId} Type=PING -> Sent PONG.");
         }
 
         private async Task HandleDataReqAsync(PvspFrame frame, CancellationToken ct)
         {
+            long processingStartTimestamp = _onDataReqCompleted != null ? Stopwatch.GetTimestamp() : 0;
+
             // Step 1 & 2: Framing is already verified; now validate UTF-8 and JSON syntax
             if (frame.PayloadLength == 0)
             {
+                ConsumeNonClosingErrorSequenceId(frame.MessageId);
                 await SendErrorAsync(frame.MessageId, PvspErrorCodes.InvalidPayload, "DATA_REQ requires a non-empty JSON payload.", ct);
                 return;
             }
 
             if (!PvspJsonSerializer.TryParseStrictJsonObject(frame.PayloadBytes, DataReqAllowedFields, DataReqRequiredFields, out var fields, out int errCode, out string errMsg))
             {
+                ConsumeNonClosingErrorSequenceId(frame.MessageId);
                 await SendErrorAsync(frame.MessageId, errCode, errMsg, ct);
                 return;
             }
@@ -358,6 +390,7 @@ namespace Pus.Vault.Server
                 !PvspJsonSerializer.TryGetInt64Field(fields, "timestamp", out long timestamp, out fieldErr) ||
                 !PvspJsonSerializer.TryGetStringField(fields, "hmac", 128, allowEmpty: false, out string hmac, out fieldErr))
             {
+                ConsumeNonClosingErrorSequenceId(frame.MessageId);
                 await SendErrorAsync(frame.MessageId, PvspErrorCodes.InvalidPayload, fieldErr, ct);
                 return;
             }
@@ -368,6 +401,7 @@ namespace Pus.Vault.Server
                 if (!PvspJsonSerializer.TryGetStringField(fields, "key", PvspConstants.MaxKeyBytes, allowEmpty: false, out string parsedKey, out fieldErr) ||
                     !PvspJsonSerializer.IsValidSecretKeyFormat(parsedKey))
                 {
+                    ConsumeNonClosingErrorSequenceId(frame.MessageId);
                     await SendErrorAsync(frame.MessageId, PvspErrorCodes.InvalidPayload, "Invalid 'key' format or length (max 128 ASCII chars: alphanumeric, '_', '-', '.').", ct);
                     return;
                 }
@@ -379,6 +413,7 @@ namespace Pus.Vault.Server
             {
                 if (!PvspJsonSerializer.TryGetStringField(fields, "value", PvspConstants.MaxValueBytes, allowEmpty: true, out string parsedVal, out fieldErr))
                 {
+                    ConsumeNonClosingErrorSequenceId(frame.MessageId);
                     await SendErrorAsync(frame.MessageId, PvspErrorCodes.InvalidPayload, fieldErr, ct);
                     return;
                 }
@@ -388,7 +423,8 @@ namespace Pus.Vault.Server
             // Validate action and allowed combination of key/value fields
             if (action is not ("SET" or "GET" or "LIST" or "DELETE"))
             {
-                await SendErrorAsync(frame.MessageId, PvspErrorCodes.InvalidAction, $"Unsupported action '{action}'.", ct);
+                ConsumeNonClosingErrorSequenceId(frame.MessageId);
+                await SendErrorAsync(frame.MessageId, PvspErrorCodes.InvalidAction, "Unsupported action. Allowed actions: SET, GET, LIST, DELETE.", ct);
                 return;
             }
 
@@ -396,22 +432,24 @@ namespace Pus.Vault.Server
                 (action is "GET" or "DELETE" && (key == null || value != null)) ||
                 (action == "SET" && (key == null || value == null)))
             {
+                ConsumeNonClosingErrorSequenceId(frame.MessageId);
                 await SendErrorAsync(frame.MessageId, PvspErrorCodes.InvalidAction, $"Invalid combination of 'key'/'value' fields for action '{action}'.", ct);
                 return;
             }
 
             // Step 5: Check Message ID sequence and duplicate request digest
-            if (!ValidateAndAdvanceSequenceId(frame, isDataReq: true, out bool isDuplicate, out int seqErrCode, out string seqErrMsg))
+            if (!ValidateAndAdvanceSequenceId(frame, isDataReq: true, out bool isDuplicate, out byte[] currentDigest, out int seqErrCode, out string seqErrMsg))
             {
                 _logger.LogSecurity(_clientEndpoint, $"Sequence/Replay error on MsgID={frame.MessageId}: {seqErrMsg}");
                 await SendErrorAndCloseAsync(frame.MessageId, seqErrCode, seqErrMsg);
                 return;
             }
 
-            if (isDuplicate && _lastResponseFrameBytes != null)
+            if (isDuplicate && _lastDataReqResponseFrameBytes != null)
             {
+                _phaseDeadlineUtc = DateTime.UtcNow + _idleTimeout;
                 _logger.LogWarn(_clientEndpoint, $"Duplicate MsgID={frame.MessageId} with identical digest -> Re-sending cached response.");
-                await _stream.WriteAsync(_lastResponseFrameBytes, ct);
+                await _stream.WriteAsync(_lastDataReqResponseFrameBytes, ct);
                 await _stream.FlushAsync(ct);
                 return;
             }
@@ -451,11 +489,14 @@ namespace Pus.Vault.Server
                 return;
             }
 
+            // Valid authenticated DATA_REQ received -> reset idle timeout
+            _phaseDeadlineUtc = DateTime.UtcNow + _idleTimeout;
+
             // Step 9: Enforce Role-Based Access Control (RBAC)
             if (!AuthAndRbacModule.IsActionAuthorized(_authenticatedSession.Role, action))
             {
                 _logger.LogSecurity(_clientEndpoint, $"RBAC Forbidden: User={_authenticatedSession.Username} Role={_authenticatedSession.Role} attempted {action}.");
-                await SendErrorAsync(frame.MessageId, PvspErrorCodes.Forbidden, $"Insufficient permissions: role {_authenticatedSession.Role} cannot execute {action}.", ct);
+                await SendErrorAsync(frame.MessageId, PvspErrorCodes.Forbidden, $"Insufficient permissions: role {_authenticatedSession.Role} cannot execute {action}.", ct, cacheDigest: currentDigest);
                 return;
             }
 
@@ -463,15 +504,22 @@ namespace Pus.Vault.Server
             if (!CheckRateLimit())
             {
                 _logger.LogWarn(_clientEndpoint, $"Rate limit exceeded (max 20 DATA_REQ / 10s) on MsgID={frame.MessageId}.");
-                await SendErrorAsync(frame.MessageId, PvspErrorCodes.RateLimit, "Rate limit exceeded: maximum 20 DATA_REQ per 10 seconds.", ct);
+                await SendErrorAsync(frame.MessageId, PvspErrorCodes.RateLimit, "Rate limit exceeded: maximum 20 DATA_REQ per 10 seconds.", ct, cacheDigest: currentDigest);
                 return;
             }
 
             // Step 11: Execute storage operation
-            await ExecuteVaultActionAsync(frame.MessageId, action, key, value, ct);
+            await ExecuteVaultActionAsync(frame.MessageId, action, key, value, currentDigest, processingStartTimestamp, ct);
         }
 
-        private async Task ExecuteVaultActionAsync(uint messageId, string action, string? key, string? value, CancellationToken ct)
+        private async Task ExecuteVaultActionAsync(
+            uint messageId,
+            string action,
+            string? key,
+            string? value,
+            byte[] requestDigest,
+            long processingStartTimestamp,
+            CancellationToken ct)
         {
             long nowUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             DataRespPayload respPayload;
@@ -483,7 +531,7 @@ namespace Pus.Vault.Server
                     if (setStatus != StorageOperationStatus.Committed)
                     {
                         _logger.LogError(_clientEndpoint, $"Storage commit failed during SET on MsgID={messageId}.");
-                        await SendErrorAsync(messageId, PvspErrorCodes.InternalServer, "Failed to persist secret to storage.", ct);
+                        await SendErrorAsync(messageId, PvspErrorCodes.InternalServer, "Failed to persist secret to storage.", ct, cacheDigest: requestDigest);
                         return;
                     }
                     respPayload = new DataRespPayload { Status = "OK", Action = "SET", Key = key, Timestamp = nowUnix };
@@ -493,7 +541,7 @@ namespace Pus.Vault.Server
                     var getStatus = _storageEngine.TryGetSecret(key!, out string? secretValue);
                     if (getStatus == StorageOperationStatus.KeyNotFound)
                     {
-                        await SendErrorAsync(messageId, PvspErrorCodes.KeyNotFound, "Requested secret key does not exist.", ct);
+                        await SendErrorAsync(messageId, PvspErrorCodes.KeyNotFound, "Requested secret key does not exist.", ct, cacheDigest: requestDigest);
                         return;
                     }
                     respPayload = new DataRespPayload { Status = "OK", Action = "GET", Key = key, Value = secretValue, Timestamp = nowUnix };
@@ -503,12 +551,12 @@ namespace Pus.Vault.Server
                     var delStatus = _storageEngine.DeleteSecret(key!);
                     if (delStatus == StorageOperationStatus.KeyNotFound)
                     {
-                        await SendErrorAsync(messageId, PvspErrorCodes.KeyNotFound, "Requested secret key does not exist.", ct);
+                        await SendErrorAsync(messageId, PvspErrorCodes.KeyNotFound, "Requested secret key does not exist.", ct, cacheDigest: requestDigest);
                         return;
                     }
                     if (delStatus != StorageOperationStatus.Committed)
                     {
-                        await SendErrorAsync(messageId, PvspErrorCodes.InternalServer, "Failed to persist deletion to storage.", ct);
+                        await SendErrorAsync(messageId, PvspErrorCodes.InternalServer, "Failed to persist deletion to storage.", ct, cacheDigest: requestDigest);
                         return;
                     }
                     respPayload = new DataRespPayload { Status = "OK", Action = "DELETE", Key = key, Timestamp = nowUnix };
@@ -518,7 +566,7 @@ namespace Pus.Vault.Server
                     var listStatus = _storageEngine.TryListKeys(out List<string> keys);
                     if (listStatus == StorageOperationStatus.ResponseTooLarge)
                     {
-                        await SendErrorAsync(messageId, PvspErrorCodes.ResponseTooLarge, "LIST response exceeds maximum key count limit.", ct);
+                        await SendErrorAsync(messageId, PvspErrorCodes.ResponseTooLarge, "LIST response exceeds maximum key count limit.", ct, cacheDigest: requestDigest);
                         return;
                     }
                     respPayload = new DataRespPayload { Status = "OK", Action = "LIST", Keys = keys, Timestamp = nowUnix };
@@ -532,15 +580,21 @@ namespace Pus.Vault.Server
             byte[] respBytes = PvspJsonSerializer.SerializeToUtf8Bytes(respPayload);
             if (respBytes.Length > PvspConstants.MaxPayloadSize)
             {
-                await SendErrorAsync(messageId, PvspErrorCodes.ResponseTooLarge, "Serialized response payload exceeds 64 KiB limit.", ct);
+                await SendErrorAsync(messageId, PvspErrorCodes.ResponseTooLarge, "Serialized response payload exceeds 64 KiB limit.", ct, cacheDigest: requestDigest);
                 return;
             }
 
             byte[] encodedFrame = PvspFrameCodec.EncodeFrame(PvspMessageType.DataResp, messageId, respBytes);
-            _lastResponseFrameBytes = encodedFrame;
+            CacheDuplicateResponse(messageId, requestDigest, encodedFrame);
 
             await _stream.WriteAsync(encodedFrame, ct);
             await _stream.FlushAsync(ct);
+
+            if (_onDataReqCompleted != null)
+            {
+                double elapsedMs = Stopwatch.GetElapsedTime(processingStartTimestamp).TotalMilliseconds;
+                _onDataReqCompleted(action, elapsedMs);
+            }
 
             _logger.LogInfo(_clientEndpoint, $"Rcv MsgID={messageId} Type=DATA_REQ Action={action} -> Status=OK");
         }
@@ -549,10 +603,12 @@ namespace Pus.Vault.Server
             PvspFrame frame,
             bool isDataReq,
             out bool isDuplicate,
+            out byte[] currentDigest,
             out int errorCode,
             out string errorMessage)
         {
             isDuplicate = false;
+            currentDigest = PvspCryptoHelper.ComputeSha256Digest(frame.PayloadBytes);
             errorCode = 0;
             errorMessage = string.Empty;
 
@@ -564,13 +620,15 @@ namespace Pus.Vault.Server
                 return false;
             }
 
-            byte[] currentDigest = PvspCryptoHelper.ComputeSha256Digest(frame.PayloadBytes);
-
-            // Check if this is a retry of the exact last accepted request in the current session
-            if (isDataReq && _lastAcceptedMessageId > 0 && frame.MessageId == _lastAcceptedMessageId)
+            // Check if this is a retry of the exact last authenticated DATA_REQ in the current session
+            if (isDataReq &&
+                _lastDataReqMessageId > 0 &&
+                _lastDataReqMessageId == _lastAcceptedMessageId &&
+                frame.MessageId == _lastDataReqMessageId)
             {
-                if (_lastRequestDigest != null &&
-                    System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(currentDigest, _lastRequestDigest))
+                if (_lastDataReqDigest != null &&
+                    _lastDataReqResponseFrameBytes != null &&
+                    CryptographicOperations.FixedTimeEquals(currentDigest, _lastDataReqDigest))
                 {
                     isDuplicate = true;
                     return true;
@@ -578,6 +636,13 @@ namespace Pus.Vault.Server
 
                 errorCode = PvspErrorCodes.ReplayDetected;
                 errorMessage = "Duplicate Message ID received with modified payload digest.";
+                return false;
+            }
+
+            if (_lastAcceptedMessageId == uint.MaxValue)
+            {
+                errorCode = PvspErrorCodes.ReplayDetected;
+                errorMessage = "Message ID counter exhausted for this session; reconnect required.";
                 return false;
             }
 
@@ -590,15 +655,44 @@ namespace Pus.Vault.Server
             }
 
             _lastAcceptedMessageId = frame.MessageId;
-            _lastRequestDigest = currentDigest;
+            ClearDuplicateCache();
             return true;
+        }
+
+        /// <summary>
+        /// Advances the sequence counter when a non-closing validation/state error (104, 106, 107, 202)
+        /// carries the exact next expected Message ID so the client can continue seamlessly with ID + 1,
+        /// without allowing out-of-sequence jumps or poisoning the DATA_REQ duplicate cache.
+        /// </summary>
+        private void ConsumeNonClosingErrorSequenceId(uint messageId)
+        {
+            if (_lastAcceptedMessageId < uint.MaxValue && messageId == _lastAcceptedMessageId + 1)
+            {
+                _lastAcceptedMessageId = messageId;
+                ClearDuplicateCache();
+            }
+        }
+
+        private void CacheDuplicateResponse(uint messageId, byte[] requestDigest, byte[] encodedResponseFrame)
+        {
+            _lastDataReqMessageId = messageId;
+            _lastDataReqDigest = requestDigest;
+            _lastDataReqResponseFrameBytes = encodedResponseFrame;
+        }
+
+        private void ClearDuplicateCache()
+        {
+            _lastDataReqMessageId = 0;
+            _lastDataReqDigest = null;
+            _lastDataReqResponseFrameBytes = null;
         }
 
         private static bool IsTimestampFresh(long clientTimestamp)
         {
             long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            long diff = Math.Abs(now - clientTimestamp);
-            return diff <= PvspConstants.TimestampWindowSeconds;
+            long minAllowed = now - PvspConstants.TimestampWindowSeconds;
+            long maxAllowed = now + PvspConstants.TimestampWindowSeconds;
+            return clientTimestamp >= minAllowed && clientTimestamp <= maxAllowed;
         }
 
         private bool CheckRateLimit()
@@ -620,19 +714,28 @@ namespace Pus.Vault.Server
             return true;
         }
 
-        private async Task SendErrorAsync(uint messageId, int errorCode, string message, CancellationToken ct)
+        private async Task SendErrorAsync(
+            uint messageId,
+            int errorCode,
+            string message,
+            CancellationToken ct,
+            byte[]? cacheDigest = null)
         {
             var errPayload = new ErrorPayload
             {
                 ErrorCode = errorCode,
-                ErrorName = PvspErrorCodes.GetName(errorCode),
-                Message = message,
+                ErrorName = SanitizeAndTruncateUtf8(PvspErrorCodes.GetName(errorCode), PvspConstants.MaxErrorNameBytes),
+                Message = SanitizeAndTruncateUtf8(message, PvspConstants.MaxErrorMessageBytes),
                 Timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
             };
 
             byte[] errBytes = PvspJsonSerializer.SerializeToUtf8Bytes(errPayload);
             byte[] encodedFrame = PvspFrameCodec.EncodeFrame(PvspMessageType.Error, messageId, errBytes);
-            _lastResponseFrameBytes = encodedFrame;
+
+            if (cacheDigest != null)
+            {
+                CacheDuplicateResponse(messageId, cacheDigest, encodedFrame);
+            }
 
             await _stream.WriteAsync(encodedFrame, ct);
             await _stream.FlushAsync(ct);
@@ -653,6 +756,29 @@ namespace Pus.Vault.Server
             {
                 _state = PvspSessionState.Closed;
             }
+        }
+
+        private static string SanitizeAndTruncateUtf8(string input, int maxUtf8Bytes)
+        {
+            if (string.IsNullOrEmpty(input))
+                return string.Empty;
+
+            var sb = new StringBuilder(input.Length);
+            int byteCount = 0;
+            foreach (Rune rune in input.EnumerateRunes())
+            {
+                if (Rune.IsControl(rune))
+                    continue;
+
+                int runeBytes = rune.Utf8SequenceLength;
+                if (byteCount + runeBytes > maxUtf8Bytes)
+                    break;
+
+                sb.Append(rune);
+                byteCount += runeBytes;
+            }
+
+            return sb.ToString();
         }
     }
 }

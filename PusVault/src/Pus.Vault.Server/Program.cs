@@ -1,5 +1,6 @@
 ﻿using System;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -14,11 +15,22 @@ namespace Pus.Vault.Server
         public static async Task<int> Main(string[] args)
         {
             int port = 8443;
+            int maxSessions = ParsePositiveIntEnv("PUS_MAX_SESSIONS", defaultValue: 64);
+            int maxHandshakes = ParsePositiveIntEnv("PUS_MAX_HANDSHAKES", defaultValue: 32);
+
             for (int i = 0; i < args.Length - 1; i++)
             {
-                if (args[i] == "--port" && int.TryParse(args[i + 1], out int parsedPort))
+                if (args[i] == "--port" && int.TryParse(args[i + 1], out int parsedPort) && parsedPort is >= 0 and <= 65535)
                 {
                     port = parsedPort;
+                }
+                else if (args[i] == "--max-sessions" && int.TryParse(args[i + 1], out int parsedSessions) && parsedSessions >= 1)
+                {
+                    maxSessions = parsedSessions;
+                }
+                else if (args[i] == "--max-handshakes" && int.TryParse(args[i + 1], out int parsedHandshakes) && parsedHandshakes >= 1)
+                {
+                    maxHandshakes = parsedHandshakes;
                 }
             }
 
@@ -47,33 +59,79 @@ namespace Pus.Vault.Server
                 }
 
                 var authModule = new AuthAndRbacModule(usersFilePath);
-                var storageEngine = new VaultStorageEngine(storeFilePath);
+                IVaultStorage storageEngine = new VaultStorageEngine(storeFilePath);
 
                 using var cts = new CancellationTokenSource();
-                Console.CancelKeyPress += (_, e) =>
+                int shutdownSignaled = 0;
+
+                void RequestGracefulShutdown(string signalName)
+                {
+                    if (Interlocked.Exchange(ref shutdownSignaled, 1) == 0)
+                    {
+                        logger.LogInfo("SERVER", $"{signalName} received. Shutting down PUS-Vault Server gracefully...");
+                        try
+                        {
+                            cts.Cancel();
+                        }
+                        catch (ObjectDisposedException)
+                        {
+                            // Already exiting
+                        }
+                    }
+                }
+
+                ConsoleCancelEventHandler cancelHandler = (_, e) =>
                 {
                     e.Cancel = true;
-                    logger.LogInfo("SERVER", "SIGINT received. Shutting down PUS-Vault Server gracefully...");
-                    cts.Cancel();
+                    RequestGracefulShutdown("SIGINT");
                 };
+                Console.CancelKeyPress += cancelHandler;
 
-                using var listener = new SocketConnectionListener(
-                    port,
-                    serverCertPath,
-                    serverKeyPath,
-                    authModule,
-                    storageEngine,
-                    logger);
+                using PosixSignalRegistration? sigTermRegistration = OperatingSystem.IsWindows()
+                    ? null
+                    : PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx =>
+                    {
+                        ctx.Cancel = true;
+                        RequestGracefulShutdown("SIGTERM");
+                    });
 
-                listener.StartListening();
-                await listener.AcceptLoopAsync(cts.Token);
-                return 0;
+                EventHandler processExitHandler = (_, _) => RequestGracefulShutdown("ProcessExit");
+                AppDomain.CurrentDomain.ProcessExit += processExitHandler;
+
+                try
+                {
+                    using var listener = new SocketConnectionListener(
+                        port,
+                        serverCertPath,
+                        serverKeyPath,
+                        authModule,
+                        storageEngine,
+                        logger,
+                        maxConcurrentSessions: maxSessions,
+                        maxConcurrentHandshakes: maxHandshakes);
+
+                    logger.LogInfo("STARTUP", $"Server limits configured: maxConcurrentSessions={maxSessions}, maxConcurrentHandshakes={maxHandshakes}.");
+                    listener.StartListening();
+                    await listener.AcceptLoopAsync(cts.Token);
+                    return 0;
+                }
+                finally
+                {
+                    Console.CancelKeyPress -= cancelHandler;
+                    AppDomain.CurrentDomain.ProcessExit -= processExitHandler;
+                }
             }
             catch (Exception ex)
             {
                 logger.LogError("STARTUP", $"Fatal server startup error: {ex.Message}");
                 return 1;
             }
+        }
+
+        private static int ParsePositiveIntEnv(string variableName, int defaultValue)
+        {
+            string? raw = Environment.GetEnvironmentVariable(variableName);
+            return int.TryParse(raw, out int parsed) && parsed >= 1 ? parsed : defaultValue;
         }
 
         private static void ProvisionInitialUsersInteractiveOrEnv(string usersFilePath, SecurityAuditLogger logger)

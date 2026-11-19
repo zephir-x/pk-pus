@@ -7,7 +7,7 @@
 [![Language](https://img.shields.io/badge/C%23-12-239120?logo=csharp&logoColor=white)](https://learn.microsoft.com/en-us/dotnet/csharp/)
 [![Protocol](https://img.shields.io/badge/Protok%C3%B3%C5%82-PVSP%20v1.0-0A66C2)](../Assets/projekt-protoko%C5%82u.pdf)
 [![Security](https://img.shields.io/badge/Bezpiecze%C5%84stwo-TLS%201.3%20%2B%20HMAC--SHA256-2EA043)](./src/Pus.Vault.Common/PvspCryptoHelper.cs)
-[![Tests](https://img.shields.io/badge/Testy-21%2F21%20Zaliczonych-brightgreen)](./tests/Pus.Vault.Tests/)
+[![Tests](https://img.shields.io/badge/Testy-32%2F32%20Zaliczonych-brightgreen)](./tests/Pus.Vault.Tests/)
 [![CI/CD](https://github.com/zephir-x/pk-pus/actions/workflows/pus-vault-ci.yml/badge.svg)](https://github.com/zephir-x/pk-pus/actions/workflows/pus-vault-ci.yml)
 [![Docker](https://img.shields.io/badge/Docker-Multi--Stage%20%2B%20Compose-2496ED?logo=docker&logoColor=white)](./Dockerfile)
 [![Platform](https://img.shields.io/badge/System-Linux%20%2F%20WSL2%20Ubuntu%2024.04-E95420?logo=ubuntu&logoColor=white)](https://ubuntu.com/)
@@ -36,14 +36,14 @@ Stanowy, wielowątkowy menedżer sekretów i konfiguracji w architekturze Klient
 **PUS-Vault** centralizuje poufne dane konfiguracyjne (klucze API, hasła bazodanowe, tokeny dostępowe) w jednym serwerowym magazynie typu klucz–wartość dostępnym przez interaktywnego klienta konsolowego CLI. Zamiast korzystać z wysokopoziomowych wrapperów sieciowych (`TcpClient`, `TcpListener`, `HttpClient`), cała komunikacja sieciowa oraz ramkowanie strumienia zostały zaimplementowane bezpośrednio na gniazdach `System.Net.Sockets.Socket` owiniętych w `SslStream`.
 
 ### Główne możliwości systemu
-- **Niskopoziomowe gniazda Dual-Stack:** Pojedyncze gniazdo nasłuchujące IPv6 (`DualMode = true`) na porcie `8443/TCP`, obsługujące jednocześnie klientów IPv6 (`::1`) oraz IPv4 (`127.0.0.1` mapowane jako `::ffff:127.0.0.1`).
+- **Niskopoziomowe gniazda Dual-Stack:** Pojedyncze gniazdo nasłuchujące IPv6 (`DualMode = true`) na porcie `8443/TCP`, obsługujące jednocześnie klientów IPv6 (`::1`) oraz IPv4 (`127.0.0.1` mapowane jako `::ffff:127.0.0.1`), z konfigurowalnymi limitami (`--max-sessions` / `--max-handshakes`), ograniczonym timeoutem kolejki handshake'u TLS (`10s`) oraz czystym zamykaniem na `SIGINT`/`SIGTERM`.
 - **Hybrydowe ramkowanie (Binarny Nagłówek + JSON):** Stały **12-bajtowy nagłówek binarny Big-Endian** (`Magic=0x5053`, `Version=0x01`, `Type`, `MessageId`, `PayloadLength`) połączony ze ścisłym ładunkiem UTF-8 JSON oraz jawną pętlą odczytu `ReadExactly`, eliminującą problem fragmentacji TCP (*partial reads*).
 - **Wielowarstwowe bezpieczeństwo (*Defense-in-Depth*):**
     - Obowiązkowy **TLS 1.3** z weryfikacją certyfikatu względem prywatnego **Custom Root CA** (`X509ChainTrustMode.CustomRootTrust`), walidacją nazwy hosta/SAN oraz rozszerzenia EKU `serverAuth`.
-    - Przechowywanie haseł wyłącznie jako skróty **PBKDF2-HMAC-SHA256** (16-bajtowa losowa sól, 600 000 iteracji), jednorazowe wyzwanie `serverNonceEcho` oraz progresywny *backoff* przeciwko atakom *brute-force*.
-    - Kanoniczne podpisy **HMAC-SHA256** per sesja (binarny format z prefiksami długości, porównanie stałoczasowe `FixedTimeEquals`), ściśle sekwencyjne `Message ID` i okno czasowe Anti-Replay $\pm 30\text{s}$.
-    - Kontrola dostępu oparta na rolach **RBAC** (`READ_WRITE` vs `READ_ONLY`) oraz *Sliding Window Rate Limiter* (`20 DATA_REQ / 10s`).
-- **Odporność i persystencja:** Serializowany, atomowy zapis magazynu (`vault_store.json.tmp` -> `Flush(true)` -> `File.Move` z uprawnieniami `0600`), wątek tła `PING`/`PONG` co 20s oraz reaktywny *Auto-Reconnect* (`1s`, `2s`, `4s`) ponawiający automatycznie wyłącznie bezpieczne odczyty `GET` i `LIST`.
+    - Przechowywanie haseł wyłącznie jako skróty **PBKDF2-HMAC-SHA256** (16-bajtowa losowa sól, 600 000 iteracji), ścisłe stałoczasowe wyzwanie `serverNonceEcho` (`<= 32 B`), 256-bitowy token sesji CSPRNG (`sessionToken`) oraz progresywny *backoff* z TTL 15 min i limitem `4096` wpisów przeciwko atakom *brute-force*.
+    - Kanoniczne podpisy **HMAC-SHA256** per sesja (binarny format z prefiksami długości, porównanie stałoczasowe `FixedTimeEquals`), ściśle monotoniczne `Message ID`, izolowany bufor duplikatów `DATA_REQ`, odporne na przepełnienie okno czasowe Anti-Replay $\pm 30\text{s}$, escapowanie znaków sterujących/ANSI (`\u001b`) w logach audytowych oraz sanityzowane/limitowane ramki `ERROR` (`<= 512 B` UTF-8 bez odbijania nieznanych nazw pól i akcji).
+    - Bezwzględne deadline'y faz (`10s` HELLO, `15s` AUTH, reset `60s` Idle wyłącznie po poprawnych ramkach), kontrola dostępu oparta na rolach **RBAC** (`READ_WRITE` vs `READ_ONLY`) oraz *Sliding Window Rate Limiter* (`20 DATA_REQ / 10s`).
+- **Odporność i persystencja:** Serializowany, atomowy zapis magazynu za abstrakcją `IVaultStorage` (`vault_store.json.tmp` -> `Flush(true)` -> `File.Move` z uprawnieniami `0600` i walidacją zepsutego/`null` JSON przy starcie), wątek tła `PING`/`PONG` co 20s z natychmiastowym zamykaniem zerwanego transportu i odzyskiwaniem sesji, dedykowany 10s timeout handshake'u TLS po stronie klienta, bezpieczna deserializacja odpowiedzi serwera, ustrukturyzowane logi UTC klienta oraz reaktywny *Auto-Reconnect* (`1s`, `2s`, `4s`) ponawiający automatycznie wyłącznie bezpieczne operacje `GET`, `LIST` i `PING` (bez cichego retry mutacji `SET`/`DELETE` po rozpoczęciu wysyłki).
 
 > 📸 **Podgląd interaktywnej sesji CLI**  
 > ![PUS-Vault Demo CLI](./docs/demo-cli-session.gif)
@@ -75,7 +75,7 @@ flowchart LR
         Listener --> Session["ClientSessionHandler<br/>(Maszyna Stanow, Anti-Replay, Rate Limit)"]
         Session --> Auth["AuthAndRbacModule<br/>(PBKDF2, Role RBAC, Backoff)"]
         Auth --> Users_File[("config/users.json<br/>(Hashe PBKDF2, 0600)")]
-        Session --> Storage["VaultStorageEngine<br/>(Atomowy Snapshot na dysk)"]
+        Session --> Storage["IVaultStorage / VaultStorageEngine<br/>(Atomowy Snapshot na dysk)"]
         Storage <--> DB_File[("data/vault_store.json<br/>(Plaintext MVP, 0600)")]
         Session --> Logger["SecurityAuditLogger<br/>(Oczyszczone logi audytowe)"]
     end
@@ -102,32 +102,32 @@ PusVault/
 ├── src/
 │   ├── Pus.Vault.Common/                    # Wspólna biblioteka protokołu PVSP v1.0 i kryptografii
 │   │   ├── ErrorCodes.cs                    # Stałe protokołu, typy ramek, stany sesji i kody błędów (100-500)
-│   │   ├── PvspModels.cs                    # Modele DTO JSON oraz rygorystyczny walidator UTF-8 i schematu
+│   │   ├── PvspModels.cs                    # Modele DTO JSON oraz rygorystyczny walidator UTF-8 (bez odbijania nazw pól)
 │   │   ├── PvspFrameCodec.cs                # Kodek 12B Big-Endian i pętla ReadExactlyLoopAsync
-│   │   └── PvspCryptoHelper.cs              # Kanoniczny HMAC-SHA256, PBKDF2, CSPRNG, CustomRootTrust
+│   │   └── PvspCryptoHelper.cs              # Kanoniczny HMAC-SHA256, PBKDF2, 256-bit CSPRNG, CustomRootTrust
 │   ├── Pus.Vault.Server/                    # Wielowątkowy serwer magazynu TLS 1.3
-│   │   ├── Program.cs                       # Punkt wejścia i konfiguracja startowa kont użytkowników
-│   │   ├── SocketConnectionListener.cs      # Surowe gniazdo Dual-Stack TCP + SslStream TLS 1.3 + limity
-│   │   ├── ClientSessionHandler.cs          # Maszyna stanów sesji, deadline'y, Anti-Replay, Rate Limiter
-│   │   ├── AuthAndRbacModule.cs             # Weryfikacja PBKDF2, ochrona timingowa, backoff i kontrola ról
-│   │   ├── VaultStorageEngine.cs            # Jedna blokada + atomowy zapis snapshotu na dysk
-│   │   └── SecurityAuditLogger.cs           # Logger z ochroną przed Log Injection i rotacją pliku
+│   │   ├── Program.cs                       # Flagi CLI/env (--port, --max-sessions, --max-handshakes), SIGINT/SIGTERM
+│   │   ├── SocketConnectionListener.cs      # Surowe gniazdo Dual-Stack TCP + SslStream TLS 1.3 + limitowany handshake
+│   │   ├── ClientSessionHandler.cs          # Maszyna stanów, bezwzględne deadline'y, Anti-Replay, izolowany cache duplikatów
+│   │   ├── AuthAndRbacModule.cs             # PBKDF2, ochrona timingowa, ścisły nonce, backoff TTL/4096, RBAC
+│   │   ├── VaultStorageEngine.cs            # Interfejs IVaultStorage + atomowy snapshot i walidacja null/uszkodzeń
+│   │   └── SecurityAuditLogger.cs           # Logger z pełnym escapowaniem znaków sterujących/ANSI i rotacją pliku
 │   └── Pus.Vault.Client/                    # Interaktywny klient CLI
 │       ├── Program.cs                       # Parser flag startowych (--host, --port, --ca, --diagnostics)
 │       ├── CliCommandLoop.cs                # Pętla REPL oraz ukryty odczyt haseł i sekretów bez echa
-│       ├── PvspClientEngine.cs              # Semafor I/O, podpisywanie HMAC, reaktywny Auto-Reconnect
+│       ├── PvspClientEngine.cs              # Semafor I/O, 10s TLS timeout, bezpieczny JSON, logi UTC, Auto-Reconnect
 │       └── KeepAliveWorker.cs               # Wątek tła wysyłający PING co 20s bezczynności
 └── tests/
-    └── Pus.Vault.Tests/                     # Zestaw testów automatycznych xUnit (21 testów dla T-01..T-12)
-        ├── ProtocolAndCryptoUnitTests.cs    # Wektory HMAC, partial reads, framing, walidacja JSON, X.509
-        ├── ServerStorageAndAuthTests.cs     # Persystencja, współbieżność, błąd dysku, RBAC, redakcja logów
-        └── PvspEndToEndSessionTests.cs      # Pełne CRUD po TLS, diagnostyka, reconnect, rate limit, 50 klientów
+    └── Pus.Vault.Tests/                     # Zestaw testów automatycznych xUnit (32 testy: T-01..T-12 + utwardzenie P1–P3)
+        ├── ProtocolAndCryptoUnitTests.cs    # Wektory HMAC, CSPRNG, partial reads, framing, walidacja JSON, X.509 (6 testów)
+        ├── ServerStorageAndAuthTests.cs     # IVaultStorage, współbieżność, błąd dysku, RBAC, audyt, reguły sesji (12 testów)
+        └── PvspEndToEndSessionTests.cs      # Żywe TLS CRUD, T-03/T-05/T-06/T-08, IPv6/KeepAlive, 50 klientów GET+SET (14 testów)
 ```
 
 | Moduł | Katalog źródłowy | Kluczowe pliki implementacji |
 | :--- | :--- | :--- |
 | **`Pus.Vault.Common`** | [`src/Pus.Vault.Common/`](./src/Pus.Vault.Common/) | [`ErrorCodes.cs`](./src/Pus.Vault.Common/ErrorCodes.cs), [`PvspModels.cs`](./src/Pus.Vault.Common/PvspModels.cs), [`PvspFrameCodec.cs`](./src/Pus.Vault.Common/PvspFrameCodec.cs), [`PvspCryptoHelper.cs`](./src/Pus.Vault.Common/PvspCryptoHelper.cs) |
-| **`Pus.Vault.Server`** | [`src/Pus.Vault.Server/`](./src/Pus.Vault.Server/) | [`SocketConnectionListener.cs`](./src/Pus.Vault.Server/SocketConnectionListener.cs), [`ClientSessionHandler.cs`](./src/Pus.Vault.Server/ClientSessionHandler.cs), [`AuthAndRbacModule.cs`](./src/Pus.Vault.Server/AuthAndRbacModule.cs), [`VaultStorageEngine.cs`](./src/Pus.Vault.Server/VaultStorageEngine.cs), [`SecurityAuditLogger.cs`](./src/Pus.Vault.Server/SecurityAuditLogger.cs) |
+| **`Pus.Vault.Server`** | [`src/Pus.Vault.Server/`](./src/Pus.Vault.Server/) | [`Program.cs`](./src/Pus.Vault.Server/Program.cs), [`SocketConnectionListener.cs`](./src/Pus.Vault.Server/SocketConnectionListener.cs), [`ClientSessionHandler.cs`](./src/Pus.Vault.Server/ClientSessionHandler.cs), [`AuthAndRbacModule.cs`](./src/Pus.Vault.Server/AuthAndRbacModule.cs), [`VaultStorageEngine.cs`](./src/Pus.Vault.Server/VaultStorageEngine.cs), [`SecurityAuditLogger.cs`](./src/Pus.Vault.Server/SecurityAuditLogger.cs) |
 | **`Pus.Vault.Client`** | [`src/Pus.Vault.Client/`](./src/Pus.Vault.Client/) | [`PvspClientEngine.cs`](./src/Pus.Vault.Client/PvspClientEngine.cs), [`KeepAliveWorker.cs`](./src/Pus.Vault.Client/KeepAliveWorker.cs), [`CliCommandLoop.cs`](./src/Pus.Vault.Client/CliCommandLoop.cs), [`Program.cs`](./src/Pus.Vault.Client/Program.cs) |
 | **`Pus.Vault.Tests`** | [`tests/Pus.Vault.Tests/`](./tests/Pus.Vault.Tests/) | [`ProtocolAndCryptoUnitTests.cs`](./tests/Pus.Vault.Tests/ProtocolAndCryptoUnitTests.cs), [`ServerStorageAndAuthTests.cs`](./tests/Pus.Vault.Tests/ServerStorageAndAuthTests.cs), [`PvspEndToEndSessionTests.cs`](./tests/Pus.Vault.Tests/PvspEndToEndSessionTests.cs) |
 
@@ -177,12 +177,12 @@ stateDiagram-v2
 
 | Kod | Typ | Kierunek | Ładunek | Timeout / Polityka |
 | :---: | :--- | :---: | :--- | :--- |
-| `0x01` / `0x02` | `HELLO` / `HELLO_ACK` | K -> S / S -> K | JSON (`clientName`, `serverNonce`) | Handshake TLS: `10s`, HELLO: `10s` |
-| `0x03` / `0x04` | `AUTH` / `AUTH_ACK` | K -> S / S -> K | JSON (`username`, `password`, `serverNonceEcho` -> `sessionToken`, `hmacSecret`, `role`) | Limit na AUTH: `15s` (maks. 3 próby / połączenie) |
+| `0x01` / `0x02` | `HELLO` / `HELLO_ACK` | K -> S / S -> K | JSON (`clientName`, `serverNonce`) | Handshake TLS: `10s` (kolejka serwera + klient), bezwzględny deadline HELLO: `10s` |
+| `0x03` / `0x04` | `AUTH` / `AUTH_ACK` | K -> S / S -> K | JSON (`username`, `password`, `serverNonceEcho` -> 256-bit `sessionToken`, `hmacSecret`, `role`) | Bezwzględny deadline AUTH: `15s` (maks. 3 próby / połączenie) |
 | `0x05` / `0x06` | `DATA_REQ` / `DATA_RESP` | K -> S / S -> K | JSON (`SET`, `GET`, `LIST`, `DELETE` + kanoniczny `hmac`) | Request Timeout klienta: `5s`, Rate Limit: `20 / 10s` |
-| `0x07` / `0x08` | `PING` / `PONG` | K -> S / S -> K | Pusty (`0` bajtów) | Interwał `PING`: `20s`, Idle Timeout serwera: `60s` |
+| `0x07` / `0x08` | `PING` / `PONG` | K -> S / S -> K | Pusty (`0` bajtów) | Interwał `PING`: `20s`, Idle Timeout serwera: `60s` (reset wyłącznie po poprawnych ramkach) |
 | `0x09` | `BYE` | K -> S | Pusty (`0` bajtów) | Eleganckie zamknięcie TLS + TCP (bez `BYE_ACK`) |
-| `0xFF` | `ERROR` | S -> K | JSON (`errorCode`, `errorName`, `message`, `timestamp`) | Kody krytyczne (`100-103`, `105`, `204`, `301`) zamykają sesję |
+| `0xFF` | `ERROR` | S -> K | JSON (`errorCode`, `errorName <= 64 B`, `message <= 512 B`, `timestamp`) | Kody krytyczne (`100-103`, `105`, `204`, `301`) zamykają sesję |
 
 ---
 
@@ -192,8 +192,8 @@ Zweryfikowane środowisko referencyjne, na którym zbudowano i przetestowano pro
 
 | Składnik | Zweryfikowana wersja | Rola w projekcie |
 | :--- | :--- | :--- |
-| **System operacyjny** | `Ubuntu 24.04.1 LTS` (WSL2 na Windows 11) | Natywne gniazda Linux oraz uprawnienia plików `0600`/`0700` |
-| **.NET SDK** | `8.0.134` | Kompilacja, uruchamianie oraz wykonywanie testów C# |
+| **System operacyjny** | `Ubuntu 24.04.1 LTS` (WSL2 na Windows 11, 12 CPUs) | Natywne gniazda Linux oraz uprawnienia plików `0600`/`0700` |
+| **.NET SDK** | `8.0.134` (Runtime `8.0.34`) | Kompilacja, uruchamianie oraz wykonywanie testów C# |
 | **OpenSSL** | `OpenSSL 3.0.13 (30 Jan 2024)` | Generowanie Custom Root CA i certyfikatów X.509 v3 z SAN/EKU |
 | **Docker Engine** *(opcjonalnie)* | `28.0.1` | Uruchomienie skonteneryzowane |
 | **Docker Compose** *(opcjonalnie)* | `v2.33.1-desktop.1` | Orkiestracja izolowanej sieci i wolumenów serwera/klienta |
@@ -218,7 +218,7 @@ chmod +x scripts/generate_certs.sh
 
 1. **Kompilacja solucji:**
    ```bash
-   dotnet build PusVault.sln
+   dotnet build PusVault.sln --configuration Release
    ```
 
 2. **Uruchomienie Serwera (Terminal 1):**
@@ -227,8 +227,9 @@ chmod +x scripts/generate_certs.sh
    # Opcja 1: Interaktywny ukryty prompt przy pierwszym starcie
    dotnet run --project src/Pus.Vault.Server
 
-   # Opcja 2: Automatyczna inicjalizacja przez zmienne środowiskowe
-   PUS_ADMIN_PASS="AdminPass123!" PUS_READER_PASS="ReaderPass123!" dotnet run --project src/Pus.Vault.Server -- --port 8443
+   # Opcja 2: Automatyczna inicjalizacja z jawnymi limitami współbieżności
+   PUS_ADMIN_PASS="AdminPass123!" PUS_READER_PASS="ReaderPass123!" \
+     dotnet run --project src/Pus.Vault.Server -- --port 8443 --max-sessions 64 --max-handshakes 32
    ```
 
 3. **Uruchomienie interaktywnego Klienta CLI (Terminal 2):**
@@ -269,7 +270,7 @@ Docker Compose buduje lekkie obrazy `.NET 8 Runtime` z wieloetapowego [`Dockerfi
 
 4. **Zatrzymanie kontenerów:**
    ```bash
-   # Zatrzymanie kontenerów z zachowaniem sekretów i kont w wolumenach
+   # Eleganckie zatrzymanie (SIGTERM) z zachowaniem sekretów i kont w wolumenach
    docker compose down
 
    # Zatrzymanie i usunięcie wolumenów (pełny reset danych)
@@ -282,9 +283,11 @@ Docker Compose buduje lekkie obrazy `.NET 8 Runtime` z wieloetapowego [`Dockerfi
 
 ### Parametry uruchomieniowe Serwera i Klienta
 
-| Aplikacja | Flaga | Domyślnie | Opis |
+| Aplikacja | Flaga / Zmienna środowiskowa | Domyślnie | Opis |
 | :--- | :--- | :--- | :--- |
-| **Serwer** | `--port <int>` | `8443` | Port nasłuchujący TCP Dual-Stack (`[::]:port`). |
+| **Serwer** | `--port <int>` | `8443` | Port nasłuchujący TCP Dual-Stack (`[::]:port`, zakres `0..65535`). |
+| **Serwer** | `--max-sessions <int>` / `PUS_MAX_SESSIONS` | `64` | Maksymalna liczba jednoczesnych aktywnych sesji klienckich (`>= 1`). |
+| **Serwer** | `--max-handshakes <int>` / `PUS_MAX_HANDSHAKES` | `32` | Maksymalna liczba równoległych negocjacji handshake TLS (`>= 1`). |
 | **Klient** | `--host <adres>` | `localhost` | Nazwa hosta lub adres IP serwera (`localhost`, `127.0.0.1`, `::1`, `pus-vault-server`). |
 | **Klient** | `--port <int>` | `8443` | Docelowy port TCP serwera. |
 | **Klient** | `--ca <ścieżka>` | `certs/ca.crt` | Ścieżka do zaufanego certyfikatu Custom Root CA (PEM). |
@@ -297,61 +300,61 @@ Docker Compose buduje lekkie obrazy `.NET 8 Runtime` z wieloetapowego [`Dockerfi
 | `login <user>` | *Brak* | `HELLO` -> `AUTH` | Pyta o hasło bez echa w terminalu i nawiązuje sesję TLS 1.3. |
 | `set <key>` | `READ_WRITE` | `DATA_REQ (SET)` | Pyta o wartość sekretu bez echa; atomowo zapisuje na dysk. |
 | `get <key>` | Dowolna | `DATA_REQ (GET)` | Pobiera wartość sekretu; automatycznie ponawiane po awarii sieci. |
-| `list` | Dowolna | `DATA_REQ (LIST)` | Zwraca posortowaną listę kluczy (maks. 1 000); ponawiane po awarii. |
+| `list` | Dowolna | `DATA_REQ (LIST)` | Zwraca posortowaną listę kluczy (maks. 1 000 / 64 KiB); ponawiane po awarii. |
 | `delete <key>` | `READ_WRITE` | `DATA_REQ (DELETE)` | Trwale usuwa sekret z pamięci RAM i pliku `vault_store.json`. |
-| `ping` | Dowolna | `PING` -> `PONG` | Wysyła ręczną ramkę kontrolną *Keep-Alive* (`PayloadLength = 0`). |
+| `ping` | Dowolna | `PING` -> `PONG` | Wysyła ręczną ramkę kontrolną *Keep-Alive* (`PayloadLength = 0`); przy timeout/zerwie zamyka transport i uruchamia *Auto-Reconnect*. |
 | `help` | Dowolna | *Lokalnie* | Wyświetla pomoc z listą dostępnych poleceń. |
 | `exit` / `quit` | Dowolna | `BYE` | Zamyka sesję TLS/TCP i czyści poświadczenia z pamięci RAM. |
 | `diag-hmac` | `--diagnostics` | `DATA_REQ` (zły HMAC) | Wysyła sfałszowany HMAC -> wymusza `204 ERR_INVALID_HMAC` i rozłączenie. |
 | `diag-replay` | `--diagnostics` | `DATA_REQ` (-120s) | Wysyła przeterminowany timestamp -> wymusza `301 ERR_REPLAY_DETECTED`. |
-| `diag-magic` | `--diagnostics` | Nagłówek `0x0000` | Wysyła błędne Magic Bytes -> wymusza `100 ERR_BAD_MAGIC` i rozłączenie. |
+| `diag-magic` | `--diagnostics` | Nagłówek `0x0000` | Wysyła błędne Magic Bytes (z Big-Endian `MsgID`) -> wymusza `100 ERR_BAD_MAGIC` i rozłączenie. |
 
 ---
 
 ## 7. Testy automatyczne i raport wydajności
 
-Projekt testowy xUnit w [`tests/Pus.Vault.Tests/`](./tests/Pus.Vault.Tests/) zawiera **21 testów automatycznych** w 3 plikach, pokrywających w 100% matrycę `T-01`..`T-12` z dokumentacji Etapu 2.
+Projekt testowy xUnit w [`tests/Pus.Vault.Tests/`](./tests/Pus.Vault.Tests/) zawiera **32 testy automatyczne** w 3 plikach (`6` + `12` + `14`), pokrywających w 100% matrycę `T-01`..`T-12` z dokumentacji Etapu 2 oraz pełny pakiet testów utwardzania bezpieczeństwa i odporności (Priorytety 1–3).
 
 ### Uruchomienie pełnej matrycy testowej
 
 ```bash
 cd PusVault
-dotnet test --logger "console;verbosity=detailed"
+dotnet test PusVault.sln --configuration Release --logger "console;verbosity=detailed"
 ```
 
-### Pokrycie matrycy testów (`T-01`..`T-12`)
+### Pokrycie matrycy testów (`T-01`..`T-12` + regresje P1–P3)
 
 | ID | Kategoria | Weryfikowany scenariusz | Metoda testowa xUnit | Wynik |
 | :---: | :--- | :--- | :--- | :---: |
 | **T-01** | Funkcjonalny | Pełny cykl CRUD (`HELLO` -> `AUTH` -> `SET` -> `GET` -> `LIST` -> `PING` -> `DELETE` -> `BYE`) i zapis w `vault_store.json` | `PvspEndToEndSessionTests.T01_T04_ClientEngine_ShouldExecuteFullCrudLifecycle_Ping_AndEnforceRbac` | PASS |
-| **T-02** | Funkcjonalny | Persystencja po restarcie serwera (`SET` -> restart -> `GET`) | `ServerStorageAndAuthTests.T02_T12_VaultStorage_ShouldPersistAcrossRestarts_AndRejectCorruptedJson`, `PvspEndToEndSessionTests.T09_T02_...` | PASS |
-| **T-03** | Bezpieczeństwa | Odrzucenie niezaufanego CA, niezgodnego SAN/hosta oraz certyfikatu bez EKU `serverAuth` (`AuthenticationException`) | `ProtocolAndCryptoUnitTests.T03_CustomCaValidator_...`, `PvspEndToEndSessionTests.T03_TlsHandshake_...` | PASS |
-| **T-04** | Bezpieczeństwa | Kontrola RBAC (`READ_ONLY` pozwala na `GET`, blokuje `SET`/`DELETE` kodem `203 ERR_FORBIDDEN`) i blokada *brute-force* | `ServerStorageAndAuthTests.T04_AuthAndRbac_...`, `PvspEndToEndSessionTests.T01_T04_...` | PASS |
-| **T-05** | Bezpieczeństwa | Manipulacja podpisem HMAC -> `204 ERR_INVALID_HMAC`, wpis `[SECURITY]` i zamknięcie sesji | `PvspEndToEndSessionTests.T05_T06_T08_Diagnostics_...` | PASS |
-| **T-06** | Bezpieczeństwa | Ochrona Replay: stary timestamp (-120s), stare ID oraz luka w numeracji `Message ID` -> `301 ERR_REPLAY_DETECTED` | `PvspEndToEndSessionTests.T05_T06_T08_Diagnostics_...`, `T06_Server_ShouldRejectOldMessageId_AndGapInMessageId_With301` | PASS |
+| **T-02** | Funkcjonalny | Persystencja po restarcie serwera (`SET` -> restart -> `GET`) oraz odrzucenie uszkodzonego lub `null` JSON przy starcie | `ServerStorageAndAuthTests.T02_T12_VaultStorage_ShouldPersistAcrossRestarts_AndRejectCorruptedOrNullValueJson`, `PvspEndToEndSessionTests.T09_T02_...` | PASS |
+| **T-03** | Bezpieczeństwa | Pozytywna akceptacja Custom CA + odrzucenie na żywym TLS 1.3 i jednostkowo: obce CA, zły SAN oraz brak EKU `serverAuth` (`AuthenticationException`) | `ProtocolAndCryptoUnitTests.T03_CustomCaValidator_...`, `PvspEndToEndSessionTests.T03_TlsHandshake_ShouldThrowAuthenticationException_OnUntrustedCa_WrongSan_AndMissingServerAuthEku` | PASS |
+| **T-04** | Bezpieczeństwa | Kontrola RBAC (`READ_ONLY`: `GET` OK, `SET`/`DELETE` -> `203`), ścisła wielkość liter nonce, blokada *brute-force* i zamknięcie po 3 błędach `AUTH` | `ServerStorageAndAuthTests.T04_AuthAndRbac_...`, `T04_SessionHandler_ShouldRejectWrongNonce_AndCloseConnectionAfter3FailedAuthAttempts`, `PvspEndToEndSessionTests.T01_T04_...` | PASS |
+| **T-05** | Bezpieczeństwa | 1-bajtowa mutacja HMAC na żywym serwerze i `diag-hmac` -> `204 ERR_INVALID_HMAC`, wpis `[SECURITY]` i natychmiastowy EOF | `PvspEndToEndSessionTests.T05_LiveServer_1ByteHmacMutation_ShouldReturn204_LogSecurity_AndCloseSocket`, `T05_T06_T08_Diagnostics_...` | PASS |
+| **T-06** | Bezpieczeństwa | Ochrona Replay: stary timestamp (-120s), `MsgID=0`, stare ID, luka w numeracji i zmodyfikowany duplikat -> `301 ERR_REPLAY_DETECTED` + EOF | `PvspEndToEndSessionTests.T05_T06_T08_Diagnostics_...`, `T06_Server_ShouldRejectMsgIdZero_OldMessageId_Gap_AndModifiedDuplicate_With301AndClose` | PASS |
 | **T-07** | Odporności | Pofragmentowany strumień TCP (`56 B` HELLO w paczkach po 3 bajty co `50 ms`) składany przez `ReadExactly` | `ProtocolAndCryptoUnitTests.T07_FrameCodec_...`, `PvspEndToEndSessionTests.T07_LiveServer_ShouldReassembleFragmentedHello_3BytesEvery50ms` | PASS |
-| **T-08** | Odporności | Błędny nagłówek binarny: Magic (`100`), wersja (`101`), nieznany typ (`102`), rozmiar > 64 KiB (`103` przed alokacją) | `ProtocolAndCryptoUnitTests.T08_FrameCodec_...`, `PvspEndToEndSessionTests.T05_T06_T08_Diagnostics_...` | PASS |
+| **T-08** | Odporności | Odrzucenie błędów framingu na żywym TLS i jednostkowo: Magic (`100` + echo `MsgID`), wersja (`101`), typ (`102`), > 64 KiB (`103` przed ładunkiem) + EOF | `ProtocolAndCryptoUnitTests.T08_FrameCodec_...`, `PvspEndToEndSessionTests.T08_LiveServer_ShouldRejectAllFramingErrors_100_101_102_103_AndCloseConnection` | PASS |
 | **T-09** | Odporności | *Auto-Reconnect* ponawia `GET` po restarcie; zerwanie po wysłaniu `SET` zwraca `IsUnknownMutationOutcome` (bez cichego retry) | `PvspEndToEndSessionTests.T09_T02_...`, `T09_ClientEngine_ShouldNotRetrySetMutation_WhenConnectionDropsAfterSend` | PASS |
-| **T-10** | Obciążeniowy | Rate Limiter (20 przechodzi, 5 odrzucone z `429`) + test obciążeniowy **50 równoległych sesji TLS 1.3** | `PvspEndToEndSessionTests.T10_RateLimiter_...`, `T10_LoadTest_50ConcurrentSessions_ShouldMeetLatencyTargetAndReportPercentiles` | PASS |
-| **T-11** | Walidacji | Błędny UTF-8/JSON (`104`), nieznane/powtórzone/null pola (`106`), zła akcja (`107`), `LIST` > 1 000 kluczy (`108`) | `ProtocolAndCryptoUnitTests.T11_StrictJsonValidator_...`, `PvspEndToEndSessionTests.T11_LiveServer_ShouldEnforceAllValidationCodes_104_106_107_108_AndKeepSessionAlive` | PASS |
-| **T-12** | Persystencji i logów | Równoległe `SET`/`DELETE`, brak zmiany RAM przy błędzie dysku, zatrzymanie na zepsutym JSON, ochrona logów przed wyciekami | `ServerStorageAndAuthTests.T12_VaultStorage_...` (3 testy), `T12_AuditLogger_...`, `ServerListenerAndSession_...` | PASS |
+| **T-10** | Obciążeniowy | Rate Limiter (20 przechodzi, 5 odrzucone z `429`) + test obciążeniowy **50 równoległych sesji TLS 1.3** (`GET` + `SET`, limity `64`/`32`) | `PvspEndToEndSessionTests.T10_RateLimiter_...`, `T10_LoadTest_50ConcurrentSessions_ShouldMeetLatencyTargetAndReportPercentiles` | PASS |
+| **T-11** | Walidacji | Błędny UTF-8/JSON (`104`), nieznane/powtórzone/null pola, limity klucza/wartości > 32 KiB i niepuste `PING`/`BYE` (`106`), zła akcja (`107`), `LIST` > 1 000 kluczy lub > 64 KiB (`108`), nieoczekiwany `PONG` (`202`) | `ProtocolAndCryptoUnitTests.T11_StrictJsonValidator_...`, `ServerStorageAndAuthTests.T11_SessionHandler_...`, `PvspEndToEndSessionTests.T11_LiveServer_...` | PASS |
+| **T-12** | Persystencji i logów | Równoległe `SET`/`DELETE`, brak zmiany RAM przy błędzie dysku, zatrzymanie na zepsutym/`null` JSON, escapowanie znaków sterujących/ANSI (`\u001b`) i zero wycieków | `ServerStorageAndAuthTests.T12_VaultStorage_...` (3 testy), `T12_AuditLogger_...`, `ServerListenerAndSession_...` | PASS |
+| **P1–P3** | Utwardzenie i E2E | Odporność `timestamp` na overflow (`301`), bezwzględne deadline'y `HELLO`/`AUTH` i `AUTHENTICATED` idle timeout (`105`), monotoniczność `MsgID` + izolowany cache duplikatów + `ERROR <= 512 B`, 256-bit CSPRNG, recovery `PING`, żywy TLS Handshake Timeout + IPv6 `::1` + `KeepAliveWorker` + ustrukturyzowane logi UTC klienta | `ProtocolAndCryptoUnitTests.Priority2_CryptoHelper_...`, `ServerStorageAndAuthTests.Priority1_...` (3 testy), `SessionHandler_ShouldEnforceAuthenticatedIdleTimeout_...`, `PvspEndToEndSessionTests.Priority1_ClientEngine_SendPing_...`, `LiveServer_ShouldEnforceTlsHandshakeTimeout_KeepAliveWorker_Ipv6Loopback_AndStructuredClientLogs` | PASS |
 
 ### Zmierzony raport wydajności (`T-10` - 50 równoległych sesji)
 
-- **Podsumowanie testów:** `Total tests: 21 | Passed: 21 | Failed: 0 | Total time: 14.06 s`
-- **Metodologia pomiaru:** 50 równoległych klientów przechodzi fazę handshake'u TLS 1.3 (`TLS_AES_256_GCM_SHA384`), uwierzytelnienia PBKDF2 oraz rozgrzewki (1 zapytanie per sesja) na interfejsie loopback (`127.0.0.1` -> Dual-Stack `[::]`). Następnie każdy klient wykonuje po 4 sekwencyjne operacje `GET` (łącznie **200 próbek**). Mierzony jest **pełny czas round-trip po stronie klienta** (wyliczenie HMAC, ramkowanie, szyfrowanie TLS, weryfikacja po stronie serwera, odczyt magazynu i parsowanie odpowiedzi), co stanowi surowszy górny limit niż samo przetwarzanie serwerowe.
+- **Zweryfikowany pełny zestaw testów (WSL2 `Ubuntu 24.04.1 LTS`, `.NET 8.0.34`, `12 CPUs`, Release):** `Total tests: 32 | Passed: 32 | Failed: 0 | Total time: 19.07 s` (`0 Warning(s), 0 Error(s)`).
+- **Metodologia pomiaru:** 50 równoległych klientów łączy się i uwierzytelnia jednocześnie z żywym serwerem działającym na **produkcyjnych limitach współbieżności (`maxSessions=64, maxHandshakes=32`)** na interfejsie loopback (`TLS_AES_256_GCM_SHA384`). Po rozgrzewce (1 zapytanie per sesja) wszystkie 50 aktywnych sesji wykonuje równolegle **200 operacji `GET` (`50 × 4`)** oraz **50 operacji `SET` (`50 × 1`)**. Mierzone i raportowane są osobno: **czas przetwarzania po stronie serwera (`Server Time`)** oraz **pełny round-trip po stronie klienta (`Client RTT`)** (HMAC, ramkowanie, TLS, wykonanie na serwerze i parsowanie odpowiedzi).
 
-| Metryka | Zmierzony wynik | Wymaganie docelowe |
-| :--- | :---: | :---: |
-| **Jednoczesne aktywne sesje** | `50` | `>= 50` |
-| **Liczba mierzonych próbek** | `200` (`50 × 4 GET`) | Z pominięciem rozgrzewki |
-| **Średnie opóźnienie (`Avg`)** | **`4.84 ms`** | `< 15.00 ms` |
-| **Mediana (`p50`)** | **`4.11 ms`** | Raportowana |
-| **95. percentyl (`p95`)** | **`9.63 ms`** | Raportowany |
+| Operacja i zakres pomiaru | Próbki | `Avg` | `p50` (Mediana) | `p95` | Wymaganie docelowe |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **`GET` — Czas przetwarzania serwera** | `200` (`50 × 4`) | **`0.13 ms`** | **`0.09 ms`** | **`0.20 ms`** | `< 15.00 ms` |
+| **`GET` — Pełny RTT klienta** | `200` (`50 × 4`) | **`9.20 ms`** | **`6.95 ms`** | **`19.17 ms`** | `< 15.00 ms` |
+| **`SET` — Czas przetwarzania serwera** *(atomowy zapis dyskowy)* | `50` (`50 × 1`) | **`3.97 ms`** | **`3.94 ms`** | **`4.82 ms`** | `< 15.00 ms` |
+| **`SET` — Pełny RTT klienta** *(atomowy zapis dyskowy)* | `50` (`50 × 1`) | **`4.59 ms`** | **`4.54 ms`** | **`5.39 ms`** | `< 15.00 ms` |
 
-> 📸 **Wynik testów automatycznych xUnit i raportu T-10**  
-> ![Wynik testów xUnit 21/21](./docs/tests-output.png)
-> ![Wynik testów xUnit 21/21 V2](./docs/tests-output-2.png)
+> 📸 **Wynik testów automatycznych xUnit i raportu T-10 *(zrzuty z wersji bazowej 21/21; po utwardzeniu Priorytetów 1–3 pakiet rozszerzony do 32/32)***  
+> ![Wynik testów xUnit bazowy](./docs/tests-output.png)
+> ![Wynik testów xUnit bazowy V2](./docs/tests-output-2.png)
 
 ---
 
@@ -369,7 +372,7 @@ Poniższe 4 scenariusze pokrywają i rozszerzają wymagania demonstracji końcow
 1. Pozostaw klienta zalogowanego jako `admin` (`pus-vault [AUTH:READ_WRITE]>`) przy zapisanym kluczu `STRIPE_API_KEY`.
 2. W **Terminalu 1** ubij serwer (`Ctrl+C`), odczekaj 1 sekundę i uruchom go ponownie.
 3. W **Terminalu 2** wywołaj `get STRIPE_API_KEY`.
-4. **Oczekiwany efekt:** Klient wypisuje `[CLIENT-NET] Connection lost during GET... Starting Auto-Reconnect...`, ponawia połączenie z wykładniczym opóźnieniem (`1s`, `2s`, `4s`), automatycznie wykonuje nowy handshake TLS 1.3 + `HELLO`/`AUTH` i zwraca wartość sekretu.
+4. **Oczekiwany efekt:** Klient wypisuje ustrukturyzowany log UTC `[YYYY-MM-DD HH:mm:ss UTC] [WARN] [Session:localhost:8443] Connection lost during GET (...). Starting Auto-Reconnect...`, ponawia połączenie z wykładniczym opóźnieniem (`1s`, `2s`, `4s`), automatycznie wykonuje nowy handshake TLS 1.3 + `HELLO`/`AUTH` i zwraca wartość sekretu.
 
 ### Scenariusz 3: Scenariusze bezpieczeństwa (RBAC, sfałszowany HMAC, Replay, błędny nagłówek)
 1. **Odmowa uprawnień RBAC (`203 ERR_FORBIDDEN`):** Zaloguj się na konto `reader` (`Reader123!`). Wywołaj `get STRIPE_API_KEY` (sukces), a następnie `delete STRIPE_API_KEY` -> Serwer zwraca `[SERVER ERROR 203 ERR_FORBIDDEN]` i zapisuje log `[SECURITY] RBAC Forbidden`.
@@ -396,10 +399,10 @@ Poniższe 4 scenariusze pokrywają i rozszerzają wymagania demonstracji końcow
 
 Zgodnie z zakresem MVP określonym w dokumentacji Etapu 1 i Etapu 2, system posiada następujące jawne ograniczenia:
 
-1. **Przechowywanie sekretów w postaci jawnej na dysku (`data/vault_store.json`):** Protokół PVSP zabezpiecza dane w transmisji (TLS 1.3 + HMAC-SHA256) oraz wymusza uwierzytelnianie i RBAC, jednak plik magazynu `data/vault_store.json` jest zapisywany jako jawny JSON (*plaintext at rest*). Kompromitacja hosta lub systemu plików pozostaje poza zakresem zagrożeń MVP. Zastosowano podstawowe środki ochrony lokalnej (uprawnienia `0700` dla `data/`, `0600` dla `vault_store.json`, wykluczenie z Gita i obrazów Docker). Szyfrowanie AEAD (np. AES-GCM z zewnętrznym kluczem głównym) stanowi rozszerzenie poza MVP.
+1. **Przechowywanie sekretów w postaci jawnej na dysku (`data/vault_store.json`):** Protokół PVSP zabezpiecza dane w transmisji (TLS 1.3 + HMAC-SHA256) oraz wymusza uwierzytelnianie i RBAC, jednak plik magazynu `data/vault_store.json` jest zapisywany jako jawny JSON (*plaintext at rest*). Kompromitacja hosta lub systemu plików pozostaje poza zakresem zagrożeń MVP. Zastosowano podstawowe środki ochrony lokalnej (uprawnienia `0700` dla `data/`, `0600` dla `vault_store.json`, wykluczenie z Gita i obrazów Docker). Dzięki wydzieleniu interfejsu `IVaultStorage`, szyfrowanie AEAD (np. AES-GCM z zewnętrznym kluczem głównym) można dodać poza MVP bez modyfikacji warstwy sieciowej i protokołu.
 2. **Brak paginacji dla `LIST`:** Operacja `LIST` zwraca wszystkie klucze w pojedynczej ramce z limitem **1 000 kluczy** oraz **64 KiB** zserializowanego ładunku UTF-8 (przekroczenie zwraca `108 ERR_RESPONSE_TOO_LARGE`).
 3. **Maksymalnie jedno żądanie w locie na sesję:** W obrębie jednego połączenia TCP klient wysyła kolejne żądanie aplikacyjne dopiero po otrzymaniu odpowiedzi na poprzednie (brak pipeliningu i równoległych zapytań w ramach jednego gniazda).
-4. **Brak automatycznego ponawiania mutacji (`SET`/`DELETE`):** Bufor deduplikacji (`302` / zapisana odpowiedź) działa wyłącznie w obrębie jednej aktywnej sesji TCP. Po utracie połączenia po wysłaniu `SET` lub `DELETE` klient nie wykonuje cichego retry po reconnectcie i zgłasza wynik nieznany.
+4. **Brak automatycznego ponawiania mutacji (`SET`/`DELETE`):** Izolowany bufor deduplikacji `DATA_REQ` odsyła zapisaną odpowiedź (`DATA_RESP` lub błąd biznesowy `ERROR`) dla identycznych powtórzeń w obrębie jednej aktywnej sesji TCP bez ponownego wykonywania mutacji. Po rozpoczęciu wysyłania ramki `SET` lub `DELETE` (`onWriteStarted`) utrata połączenia nie powoduje cichego retry po reconnectcie, lecz zwrócenie wyniku nieznanego.
 5. **Tymczasowe buforowanie poświadczeń w pamięci RAM klienta:** Na potrzeby reaktywnego *Auto-Reconnect* klient przechowuje w pamięci procesu login i hasło zalogowanego użytkownika do czasu wyjścia (`exit`) lub zniszczenia obiektu (bez zapisu na dysk i bez logowania).
 6. **Plikowy rejestr kont użytkowników:** Konta (`admin`, `reader`) wczytywane są przy starcie serwera z `config/users.json` (hashe PBKDF2); dynamiczne zarządzanie kontami przez protokół nie wchodzi w zakres MVP.
 

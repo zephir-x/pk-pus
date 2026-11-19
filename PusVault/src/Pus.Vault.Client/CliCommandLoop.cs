@@ -22,7 +22,7 @@ namespace Pus.Vault.Client
             _keepAliveWorker = keepAliveWorker;
             _diagnosticsEnabled = diagnosticsEnabled;
 
-            _clientEngine.OnDiagnosticLog = msg => Console.WriteLine($"[CLIENT-NET] {msg}");
+            _clientEngine.OnDiagnosticLog = msg => Console.WriteLine(msg);
         }
 
         /// <summary>
