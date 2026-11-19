@@ -8,6 +8,7 @@
 [![Protocol](https://img.shields.io/badge/Protocol-PVSP%20v1.0-0A66C2)](../Assets/projekt-protoko%C5%82u.pdf)
 [![Security](https://img.shields.io/badge/Security-TLS%201.3%20%2B%20HMAC--SHA256-2EA043)](./src/Pus.Vault.Common/PvspCryptoHelper.cs)
 [![Tests](https://img.shields.io/badge/Tests-21%2F21%20Passing-brightgreen)](./tests/Pus.Vault.Tests/)
+[![CI/CD](https://github.com/zephir-x/pk-pus/actions/workflows/pus-vault-ci.yml/badge.svg)](https://github.com/zephir-x/pk-pus/actions/workflows/pus-vault-ci.yml)
 [![Docker](https://img.shields.io/badge/Docker-Multi--Stage%20%2B%20Compose-2496ED?logo=docker&logoColor=white)](./Dockerfile)
 [![Platform](https://img.shields.io/badge/OS-Linux%20%2F%20WSL2%20Ubuntu%2024.04-E95420?logo=ubuntu&logoColor=white)](https://ubuntu.com/)
 

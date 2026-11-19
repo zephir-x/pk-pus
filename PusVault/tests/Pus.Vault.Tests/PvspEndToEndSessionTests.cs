@@ -344,8 +344,11 @@ namespace Pus.Vault.Tests
             // Simulate a server that completes HELLO and AUTH, reads the SET frame from the client,
             // and immediately drops the connection BEFORE sending DATA_RESP!
             using var serverCert = X509Certificate2.CreateFromPemFile(_serverCertPath, _serverKeyPath);
-            using var listenSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-            listenSocket.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+            using var listenSocket = new Socket(AddressFamily.InterNetworkV6, SocketType.Stream, ProtocolType.Tcp)
+            {
+                DualMode = true
+            };
+            listenSocket.Bind(new IPEndPoint(IPAddress.IPv6Any, 0));
             listenSocket.Listen(5);
             int port = ((IPEndPoint)listenSocket.LocalEndPoint!).Port;
 
