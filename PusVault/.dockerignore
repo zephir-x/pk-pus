@@ -1,0 +1,15 @@
+# Build artifacts
+**/bin/
+**/obj/
+.idea/
+
+# Runtime secrets, PKI certificates, and local data (must never be baked into images)
+certs/
+config/
+data/
+logs/
+.env
+
+# Tests and local documentation
+tests/
+*.md

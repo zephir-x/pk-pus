@@ -10,4 +10,5 @@ PusVault/certs/
 PusVault/config/
 PusVault/data/
 PusVault/logs/
+PusVault/.env
 PusVault/STUDY_GUIDE.md

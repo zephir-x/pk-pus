@@ -1,0 +1,59 @@
+services:
+  pus-vault-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: server
+    container_name: pus-vault-server
+    hostname: pus-vault-server
+    ports:
+      - "8443:8443"
+    environment:
+      - PUS_ADMIN_PASS=${PUS_ADMIN_PASS:?Set PUS_ADMIN_PASS in .env file}
+      - PUS_READER_PASS=${PUS_READER_PASS:?Set PUS_READER_PASS in .env file}
+    volumes:
+      # Mount only server certificate and private key in read-only mode
+      - ./certs/server.crt:/app/certs/server.crt:ro
+      - ./certs/server.key:/app/certs/server.key:ro
+      # Named volumes isolate persistent vault storage, PBKDF2 user config, and audit logs
+      - vault_config:/app/config
+      - vault_data:/app/data
+      - vault_logs:/app/logs
+    networks:
+      - pus-vault-net
+    restart: unless-stopped
+
+  pus-vault-client:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: client
+    profiles:
+      - cli
+    depends_on:
+      - pus-vault-server
+    stdin_open: true
+    tty: true
+    volumes:
+      # Principle of least privilege: client receives ONLY the public Custom Root CA certificate
+      - ./certs/ca.crt:/app/certs/ca.crt:ro
+    entrypoint:
+      - dotnet
+      - Pus.Vault.Client.dll
+      - --host
+      - pus-vault-server
+      - --port
+      - "8443"
+      - --ca
+      - /app/certs/ca.crt
+    networks:
+      - pus-vault-net
+
+volumes:
+  vault_config:
+  vault_data:
+  vault_logs:
+
+networks:
+  pus-vault-net:
+    driver: bridge
