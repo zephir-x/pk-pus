@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Net;
@@ -43,7 +43,7 @@ namespace Pus.Vault.Tests
             File.WriteAllText(storePath, "{corrupted_json_without_closing_brace");
             Assert.Throws<InvalidDataException>(() => new VaultStorageEngine(storePath));
 
-            // 3. Write a JSON object containing a null secret value and verify startup rejects it cleanly (Priority 2)
+            // 3. Write a JSON object containing a null secret value and verify startup rejects it cleanly
             File.WriteAllText(storePath, "{\"NULL_KEY\": null}");
             Assert.Throws<InvalidDataException>(() => new VaultStorageEngine(storePath));
         }
@@ -457,11 +457,11 @@ namespace Pus.Vault.Tests
         }
 
         [Fact]
-        public async Task Priority1_SessionHandler_ShouldRejectExtremeTimestamps_WithoutOverflowException()
+        public async Task T06_SessionHandler_ShouldRejectExtremeTimestamps_WithoutOverflow()
         {
-            string usersPath = Path.Combine(_tempDir, "config", "users_p1_ts.json");
-            string storePath = Path.Combine(_tempDir, "data", "store_p1_ts.json");
-            string logsDir = Path.Combine(_tempDir, "logs_p1_ts");
+            string usersPath = Path.Combine(_tempDir, "config", "users_ts.json");
+            string storePath = Path.Combine(_tempDir, "data", "store_ts.json");
+            string logsDir = Path.Combine(_tempDir, "logs_ts");
 
             AuthAndRbacModule.ProvisionUsersFile(usersPath, "AdminPass!123", "ReaderPass!123");
             var auth = new AuthAndRbacModule(usersPath);
@@ -503,11 +503,11 @@ namespace Pus.Vault.Tests
         }
 
         [Fact]
-        public async Task Priority1_SessionHandler_ShouldEnforceAbsoluteHelloAndAuthDeadlines_AgainstInvalidFrameSpam()
+        public async Task SessionHandler_ShouldEnforceAbsoluteHelloAndAuthDeadlines_AgainstInvalidFrameSpam()
         {
-            string usersPath = Path.Combine(_tempDir, "config", "users_p1_deadline.json");
-            string storePath = Path.Combine(_tempDir, "data", "store_p1_deadline.json");
-            string logsDir = Path.Combine(_tempDir, "logs_p1_deadline");
+            string usersPath = Path.Combine(_tempDir, "config", "users_deadline.json");
+            string storePath = Path.Combine(_tempDir, "data", "store_deadline.json");
+            string logsDir = Path.Combine(_tempDir, "logs_deadline");
 
             AuthAndRbacModule.ProvisionUsersFile(usersPath, "AdminPass!123", "ReaderPass!123");
             var auth = new AuthAndRbacModule(usersPath);
@@ -603,11 +603,11 @@ namespace Pus.Vault.Tests
         }
 
         [Fact]
-        public async Task Priority1_SessionHandler_ShouldAdvanceSequenceIdOnNonClosingErrors_AndPreventDuplicateCachePoisoning()
+        public async Task SessionHandler_ShouldAdvanceSequenceIdOnNonClosingErrors_AndIsolateDuplicateCache()
         {
-            string usersPath = Path.Combine(_tempDir, "config", "users_p1_seq.json");
-            string storePath = Path.Combine(_tempDir, "data", "store_p1_seq.json");
-            string logsDir = Path.Combine(_tempDir, "logs_p1_seq");
+            string usersPath = Path.Combine(_tempDir, "config", "users_seq.json");
+            string storePath = Path.Combine(_tempDir, "data", "store_seq.json");
+            string logsDir = Path.Combine(_tempDir, "logs_seq");
 
             AuthAndRbacModule.ProvisionUsersFile(usersPath, "AdminPass!123", "ReaderPass!123");
             var auth = new AuthAndRbacModule(usersPath);

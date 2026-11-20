@@ -15,22 +15,23 @@ using Pus.Vault.Common;
 namespace Pus.Vault.Client
 {
     /// <summary>
-    /// High-level result of a client vault operation (GET, SET, LIST, DELETE).
+    /// Represents the outcome of a high-level client vault operation (SET, GET, LIST, DELETE, PING).
     /// </summary>
     public class ClientOperationResult
     {
         public bool IsSuccess { get; init; }
-        public bool IsUnknownMutationOutcome { get; init; }
         public int ErrorCode { get; init; }
         public string ErrorName { get; init; } = string.Empty;
         public string Message { get; init; } = string.Empty;
         public string? Value { get; init; }
         public List<string>? Keys { get; init; }
+        public bool IsUnknownMutationOutcome { get; init; }
     }
 
     /// <summary>
-    /// Manages the client-side TCP socket, TLS 1.3 SslStream, serialized frame writer/reader queue,
-    /// Message ID sequence counter, canonical HMAC signing, and reactive Auto-Reconnect with Exponential Backoff.
+    /// Core networking and PVSP v1.0 protocol engine for the PUS-Vault Client.
+    /// Uses raw System.Net.Sockets.Socket wrapped in SslStream (TLS 1.3 + Custom Root CA),
+    /// serialized by a single I/O SemaphoreSlim so CLI commands and background Keep-Alive PING never interleave.
     /// </summary>
     public class PvspClientEngine : IDisposable
     {
@@ -41,8 +42,8 @@ namespace Pus.Vault.Client
         private readonly TimeSpan _tlsHandshakeTimeout;
         private readonly TimeSpan[] _backoffDelays;
 
-        // Single semaphore serializing all request-response cycles over the SslStream
         private readonly SemaphoreSlim _ioLock = new(1, 1);
+        private readonly object _stateLock = new();
 
         private Socket? _socket;
         private SslStream? _sslStream;
@@ -57,17 +58,23 @@ namespace Pus.Vault.Client
         private string? _cachedUsername;
         private string? _cachedPassword;
 
-        private int _requestInFlightFlag;
-        private long _lastActivityUtcTicks = DateTime.UtcNow.Ticks;
+        private bool _isRequestInFlight;
+        private DateTime _lastActivityUtc = DateTime.UtcNow;
 
         public bool IsAuthenticated => !string.IsNullOrEmpty(_sessionToken) && _sslStream != null;
         public string AssignedRole => _assignedRole;
+
         public DateTime LastActivityUtc
         {
-            get => new DateTime(Interlocked.Read(ref _lastActivityUtcTicks), DateTimeKind.Utc);
-            private set => Interlocked.Exchange(ref _lastActivityUtcTicks, value.ToUniversalTime().Ticks);
+            get { lock (_stateLock) { return _lastActivityUtc; } }
+            private set { lock (_stateLock) { _lastActivityUtc = value.ToUniversalTime(); } }
         }
-        public bool IsRequestInFlight => Volatile.Read(ref _requestInFlightFlag) == 1;
+
+        public bool IsRequestInFlight
+        {
+            get { lock (_stateLock) { return _isRequestInFlight; } }
+            private set { lock (_stateLock) { _isRequestInFlight = value; } }
+        }
 
         // Optional callback for structured client diagnostic/session logs
         public Action<string>? OnDiagnosticLog { get; set; }
@@ -104,7 +111,7 @@ namespace Pus.Vault.Client
             await _ioLock.WaitAsync(ct);
             try
             {
-                Volatile.Write(ref _requestInFlightFlag, 1);
+                IsRequestInFlight = true;
                 var result = await EstablishSessionInternalAsync(username, password, ct);
                 if (result.Success)
                 {
@@ -115,7 +122,7 @@ namespace Pus.Vault.Client
             }
             finally
             {
-                Volatile.Write(ref _requestInFlightFlag, 0);
+                IsRequestInFlight = false;
                 _ioLock.Release();
             }
         }
@@ -134,7 +141,7 @@ namespace Pus.Vault.Client
             await _ioLock.WaitAsync(ct);
             try
             {
-                Volatile.Write(ref _requestInFlightFlag, 1);
+                IsRequestInFlight = true;
 
                 if (!IsAuthenticated)
                 {
@@ -216,7 +223,7 @@ namespace Pus.Vault.Client
             }
             finally
             {
-                Volatile.Write(ref _requestInFlightFlag, 0);
+                IsRequestInFlight = false;
                 _ioLock.Release();
             }
         }
@@ -233,7 +240,7 @@ namespace Pus.Vault.Client
                 if (!IsAuthenticated || _sslStream == null)
                     return false;
 
-                Volatile.Write(ref _requestInFlightFlag, 1);
+                IsRequestInFlight = true;
 
                 try
                 {
@@ -276,7 +283,7 @@ namespace Pus.Vault.Client
             }
             finally
             {
-                Volatile.Write(ref _requestInFlightFlag, 0);
+                IsRequestInFlight = false;
                 _ioLock.Release();
             }
         }
@@ -373,7 +380,7 @@ namespace Pus.Vault.Client
 
                 FrameReadResult resp = await PvspFrameCodec.ReadFrameAsync(_sslStream, timeoutCts.Token);
                 CloseTransportInternal(); // Server closes connection on 204 ERR_INVALID_HMAC
-                return ParseServerResponse(resp, msgId);
+                return ParseServerResponse(resp, msgId, "LIST");
             }
             finally
             {
@@ -411,7 +418,7 @@ namespace Pus.Vault.Client
 
                 FrameReadResult resp = await PvspFrameCodec.ReadFrameAsync(_sslStream, timeoutCts.Token);
                 CloseTransportInternal(); // Server closes connection on 301 ERR_REPLAY_DETECTED
-                return ParseServerResponse(resp, msgId);
+                return ParseServerResponse(resp, msgId, "LIST");
             }
             finally
             {
@@ -596,6 +603,23 @@ namespace Pus.Vault.Client
                     return (false, "Received malformed AUTH_ACK payload from server.", 0);
                 }
 
+                // Validate that hmacSecret decodes cleanly to a 32-byte key
+                try
+                {
+                    if (Convert.FromBase64String(authAck.HmacSecret).Length != 32)
+                    {
+                        CloseTransportInternal();
+                        Log("ERROR", "Received AUTH_ACK with invalid hmacSecret length.");
+                        return (false, "Received AUTH_ACK with invalid hmacSecret length.", 0);
+                    }
+                }
+                catch (FormatException)
+                {
+                    CloseTransportInternal();
+                    Log("ERROR", "Received AUTH_ACK with invalid Base64 hmacSecret.");
+                    return (false, "Received AUTH_ACK with invalid Base64 hmacSecret.", 0);
+                }
+
                 _sessionToken = authAck.SessionToken;
                 _hmacSecretBase64 = authAck.HmacSecret;
                 _assignedRole = authAck.Role;
@@ -630,7 +654,7 @@ namespace Pus.Vault.Client
                 throw new IOException("TLS stream is not connected.");
             }
 
-            uint msgId = _nextMessageId++;
+            uint msgId = _nextMessageId;
             var reqPayload = new DataReqPayload
             {
                 SessionToken = _sessionToken,
@@ -642,6 +666,20 @@ namespace Pus.Vault.Client
 
             reqPayload.Hmac = PvspCryptoHelper.ComputeDataReqHmacHex(_hmacSecretBase64, msgId, reqPayload);
             byte[] payloadBytes = PvspJsonSerializer.SerializeToUtf8Bytes(reqPayload);
+
+            // Prevent sending oversized JSON payloads (e.g., if JSON escaping expanded a large secret past 64 KiB)
+            if (payloadBytes.Length > PvspConstants.MaxPayloadSize)
+            {
+                return new ClientOperationResult
+                {
+                    IsSuccess = false,
+                    ErrorCode = PvspErrorCodes.PayloadTooLarge,
+                    ErrorName = PvspErrorCodes.GetName(PvspErrorCodes.PayloadTooLarge),
+                    Message = $"Serialized request payload ({payloadBytes.Length} B) exceeds the 64 KiB protocol limit."
+                };
+            }
+
+            _nextMessageId++;
 
             using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             timeoutCts.CancelAfter(_requestTimeout);
@@ -659,10 +697,10 @@ namespace Pus.Vault.Client
             }
 
             LastActivityUtc = DateTime.UtcNow;
-            return ParseServerResponse(respResult, msgId);
+            return ParseServerResponse(respResult, msgId, action);
         }
 
-        private ClientOperationResult ParseServerResponse(FrameReadResult respResult, uint expectedMsgId)
+        private ClientOperationResult ParseServerResponse(FrameReadResult respResult, uint expectedMsgId, string? expectedAction = null)
         {
             if (respResult.IsEof || !respResult.HeaderReadComplete)
             {
@@ -688,6 +726,17 @@ namespace Pus.Vault.Client
 
             if (respResult.Frame.MessageType == PvspMessageType.Error)
             {
+                if (respResult.Frame.MessageId != expectedMsgId && respResult.Frame.MessageId != 0)
+                {
+                    CloseTransportInternal();
+                    Log("ERROR", $"Protocol desynchronization on ERROR: expected MsgID={expectedMsgId} (or 0), got {respResult.Frame.MessageId}.");
+                    return new ClientOperationResult
+                    {
+                        IsSuccess = false,
+                        Message = "Received ERROR frame with mismatched Message ID."
+                    };
+                }
+
                 if (!TryDeserializePayload<ErrorPayload>(respResult.Frame.PayloadBytes, out var err))
                 {
                     CloseTransportInternal();
@@ -728,21 +777,23 @@ namespace Pus.Vault.Client
                 };
             }
 
-            if (!TryDeserializePayload<DataRespPayload>(respResult.Frame.PayloadBytes, out var dataResp))
+            if (!TryDeserializePayload<DataRespPayload>(respResult.Frame.PayloadBytes, out var dataResp) ||
+                !string.Equals(dataResp!.Status, "OK", StringComparison.Ordinal) ||
+                (expectedAction != null && !string.Equals(dataResp.Action, expectedAction, StringComparison.Ordinal)))
             {
                 CloseTransportInternal();
-                Log("ERROR", "Received DATA_RESP frame with malformed JSON payload.");
+                Log("ERROR", "Received DATA_RESP frame with invalid status, action, or malformed JSON payload.");
                 return new ClientOperationResult
                 {
                     IsSuccess = false,
-                    Message = "Received malformed DATA_RESP payload from server."
+                    Message = "Received invalid DATA_RESP payload from server."
                 };
             }
 
             return new ClientOperationResult
             {
                 IsSuccess = true,
-                Message = $"OK ({dataResp!.Action})",
+                Message = $"OK ({dataResp.Action})",
                 Value = dataResp.Value,
                 Keys = dataResp.Keys
             };

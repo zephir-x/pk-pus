@@ -62,21 +62,26 @@ namespace Pus.Vault.Server
                 IVaultStorage storageEngine = new VaultStorageEngine(storeFilePath);
 
                 using var cts = new CancellationTokenSource();
-                int shutdownSignaled = 0;
+                object shutdownLock = new();
+                bool shutdownRequested = false;
 
                 void RequestGracefulShutdown(string signalName)
                 {
-                    if (Interlocked.Exchange(ref shutdownSignaled, 1) == 0)
+                    lock (shutdownLock)
                     {
-                        logger.LogInfo("SERVER", $"{signalName} received. Shutting down PUS-Vault Server gracefully...");
-                        try
-                        {
-                            cts.Cancel();
-                        }
-                        catch (ObjectDisposedException)
-                        {
-                            // Already exiting
-                        }
+                        if (shutdownRequested)
+                            return;
+                        shutdownRequested = true;
+                    }
+
+                    logger.LogInfo("SERVER", $"{signalName} received. Shutting down PUS-Vault Server gracefully...");
+                    try
+                    {
+                        cts.Cancel();
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        // Already exiting
                     }
                 }
 
@@ -94,9 +99,6 @@ namespace Pus.Vault.Server
                         ctx.Cancel = true;
                         RequestGracefulShutdown("SIGTERM");
                     });
-
-                EventHandler processExitHandler = (_, _) => RequestGracefulShutdown("ProcessExit");
-                AppDomain.CurrentDomain.ProcessExit += processExitHandler;
 
                 try
                 {
@@ -118,7 +120,6 @@ namespace Pus.Vault.Server
                 finally
                 {
                     Console.CancelKeyPress -= cancelHandler;
-                    AppDomain.CurrentDomain.ProcessExit -= processExitHandler;
                 }
             }
             catch (Exception ex)

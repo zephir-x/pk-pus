@@ -40,10 +40,10 @@ Stanowy, wielowątkowy menedżer sekretów i konfiguracji w architekturze Klient
 - **Hybrydowe ramkowanie (Binarny Nagłówek + JSON):** Stały **12-bajtowy nagłówek binarny Big-Endian** (`Magic=0x5053`, `Version=0x01`, `Type`, `MessageId`, `PayloadLength`) połączony ze ścisłym ładunkiem UTF-8 JSON oraz jawną pętlą odczytu `ReadExactly`, eliminującą problem fragmentacji TCP (*partial reads*).
 - **Wielowarstwowe bezpieczeństwo (*Defense-in-Depth*):**
     - Obowiązkowy **TLS 1.3** z weryfikacją certyfikatu względem prywatnego **Custom Root CA** (`X509ChainTrustMode.CustomRootTrust`), walidacją nazwy hosta/SAN oraz rozszerzenia EKU `serverAuth`.
-    - Przechowywanie haseł wyłącznie jako skróty **PBKDF2-HMAC-SHA256** (16-bajtowa losowa sól, 600 000 iteracji), ścisłe stałoczasowe wyzwanie `serverNonceEcho` (`<= 32 B`), 256-bitowy token sesji CSPRNG (`sessionToken`) oraz progresywny *backoff* z TTL 15 min i limitem `4096` wpisów przeciwko atakom *brute-force*.
-    - Kanoniczne podpisy **HMAC-SHA256** per sesja (binarny format z prefiksami długości, porównanie stałoczasowe `FixedTimeEquals`), ściśle monotoniczne `Message ID`, izolowany bufor duplikatów `DATA_REQ`, odporne na przepełnienie okno czasowe Anti-Replay $\pm 30\text{s}$, escapowanie znaków sterujących/ANSI (`\u001b`) w logach audytowych oraz sanityzowane/limitowane ramki `ERROR` (`<= 512 B` UTF-8 bez odbijania nieznanych nazw pól i akcji).
-    - Bezwzględne deadline'y faz (`10s` HELLO, `15s` AUTH, reset `60s` Idle wyłącznie po poprawnych ramkach), kontrola dostępu oparta na rolach **RBAC** (`READ_WRITE` vs `READ_ONLY`) oraz *Sliding Window Rate Limiter* (`20 DATA_REQ / 10s`).
-- **Odporność i persystencja:** Serializowany, atomowy zapis magazynu za abstrakcją `IVaultStorage` (`vault_store.json.tmp` -> `Flush(true)` -> `File.Move` z uprawnieniami `0600` i walidacją zepsutego/`null` JSON przy starcie), wątek tła `PING`/`PONG` co 20s z natychmiastowym zamykaniem zerwanego transportu i odzyskiwaniem sesji, dedykowany 10s timeout handshake'u TLS po stronie klienta, bezpieczna deserializacja odpowiedzi serwera, ustrukturyzowane logi UTC klienta oraz reaktywny *Auto-Reconnect* (`1s`, `2s`, `4s`) ponawiający automatycznie wyłącznie bezpieczne operacje `GET`, `LIST` i `PING` (bez cichego retry mutacji `SET`/`DELETE` po rozpoczęciu wysyłki).
+    - Przechowywanie haseł wyłącznie jako skróty **PBKDF2-HMAC-SHA256** (16-bajtowa losowa sól, 600 000 iteracji, walidacja Base64 i długości pól `users.json` przy starcie), ścisłe stałoczasowe wyzwanie `serverNonceEcho` (`<= 32 B`), 256-bitowy token sesji CSPRNG (`sessionToken`) oraz progresywny *backoff* z TTL 15 min i limitem `4096` wpisów przeciwko atakom *brute-force*.
+    - Kanoniczne podpisy **HMAC-SHA256** per sesja (binarny format z prefiksami długości, porównanie stałoczasowe `FixedTimeEquals`), ściśle monotoniczne `Message ID`, izolowany bufor duplikatów `DATA_REQ` (z weryfikacją świeżości czasu i rate limitu), odporne na przepełnienie okno czasowe Anti-Replay $\pm 30\text{s}$, escapowanie znaków sterujących/ANSI (`\u001b`) w logach audytowych oraz sanityzowane/limitowane ramki `ERROR` (`<= 512 B` UTF-8 bez odbijania nieznanych nazw pól i akcji).
+    - Bezwzględne deadline'y faz (`10s` HELLO, `15s` AUTH, reset `60s` Idle wyłącznie po poprawnych ramkach), ograniczony `5s` timeout zapisu po stronie serwera, kontrola dostępu oparta na rolach **RBAC** (`READ_WRITE` vs `READ_ONLY`) oraz *Sliding Window Rate Limiter* (`20 DATA_REQ / 10s`).
+- **Odporność i persystencja:** Serializowany, atomowy zapis magazynu za abstrakcją `IVaultStorage` (`vault_store.json.tmp` -> `Flush(true)` -> `File.Move` z uprawnieniami `0600` i walidacją zepsutego/`null` JSON przy starcie), wątek tła `PING`/`PONG` co 20s z natychmiastowym zamykaniem zerwanego transportu i odzyskiwaniem sesji, dedykowany 10s timeout handshake'u TLS po stronie klienta, lokalna kontrola limitu 64 KiB przed wysyłką, ścisła walidacja `AUTH_ACK` i `DATA_RESP`, ustrukturyzowane logi UTC klienta oraz reaktywny *Auto-Reconnect* (`1s`, `2s`, `4s`) ponawiający automatycznie wyłącznie bezpieczne operacje `GET`, `LIST` i `PING` (bez cichego retry mutacji `SET`/`DELETE` po rozpoczęciu wysyłki).
 
 > 📸 **Podgląd interaktywnej sesji CLI**  
 > ![PUS-Vault Demo CLI](./docs/demo-cli-session.gif)
@@ -118,7 +118,7 @@ PusVault/
 │       ├── PvspClientEngine.cs              # Semafor I/O, 10s TLS timeout, bezpieczny JSON, logi UTC, Auto-Reconnect
 │       └── KeepAliveWorker.cs               # Wątek tła wysyłający PING co 20s bezczynności
 └── tests/
-    └── Pus.Vault.Tests/                     # Zestaw testów automatycznych xUnit (32 testy: T-01..T-12 + utwardzenie P1–P3)
+    └── Pus.Vault.Tests/                     # Zestaw testów automatycznych xUnit (32 testy: T-01..T-12 i przypadki brzegowe)
         ├── ProtocolAndCryptoUnitTests.cs    # Wektory HMAC, CSPRNG, partial reads, framing, walidacja JSON, X.509 (6 testów)
         ├── ServerStorageAndAuthTests.cs     # IVaultStorage, współbieżność, błąd dysku, RBAC, audyt, reguły sesji (12 testów)
         └── PvspEndToEndSessionTests.cs      # Żywe TLS CRUD, T-03/T-05/T-06/T-08, IPv6/KeepAlive, 50 klientów GET+SET (14 testów)
@@ -313,7 +313,7 @@ Docker Compose buduje lekkie obrazy `.NET 8 Runtime` z wieloetapowego [`Dockerfi
 
 ## 7. Testy automatyczne i raport wydajności
 
-Projekt testowy xUnit w [`tests/Pus.Vault.Tests/`](./tests/Pus.Vault.Tests/) zawiera **32 testy automatyczne** w 3 plikach (`6` + `12` + `14`), pokrywających w 100% matrycę `T-01`..`T-12` z dokumentacji Etapu 2 oraz pełny pakiet testów utwardzania bezpieczeństwa i odporności (Priorytety 1–3).
+Projekt testowy xUnit w [`tests/Pus.Vault.Tests/`](./tests/Pus.Vault.Tests/) zawiera **32 testy automatyczne** w 3 plikach (`6` + `12` + `14`), pokrywających w 100% matrycę `T-01`..`T-12` z dokumentacji Etapu 2 oraz rozszerzone testy brzegowe protokołu, bezpieczeństwa i odporności.
 
 ### Uruchomienie pełnej matrycy testowej
 
@@ -322,7 +322,7 @@ cd PusVault
 dotnet test PusVault.sln --configuration Release --logger "console;verbosity=detailed"
 ```
 
-### Pokrycie matrycy testów (`T-01`..`T-12` + regresje P1–P3)
+### Pokrycie matrycy testów (`T-01`..`T-12` i rozszerzone testy protokołu)
 
 | ID | Kategoria | Weryfikowany scenariusz | Metoda testowa xUnit | Wynik |
 | :---: | :--- | :--- | :--- | :---: |
@@ -331,28 +331,28 @@ dotnet test PusVault.sln --configuration Release --logger "console;verbosity=det
 | **T-03** | Bezpieczeństwa | Pozytywna akceptacja Custom CA + odrzucenie na żywym TLS 1.3 i jednostkowo: obce CA, zły SAN oraz brak EKU `serverAuth` (`AuthenticationException`) | `ProtocolAndCryptoUnitTests.T03_CustomCaValidator_...`, `PvspEndToEndSessionTests.T03_TlsHandshake_ShouldThrowAuthenticationException_OnUntrustedCa_WrongSan_AndMissingServerAuthEku` | PASS |
 | **T-04** | Bezpieczeństwa | Kontrola RBAC (`READ_ONLY`: `GET` OK, `SET`/`DELETE` -> `203`), ścisła wielkość liter nonce, blokada *brute-force* i zamknięcie po 3 błędach `AUTH` | `ServerStorageAndAuthTests.T04_AuthAndRbac_...`, `T04_SessionHandler_ShouldRejectWrongNonce_AndCloseConnectionAfter3FailedAuthAttempts`, `PvspEndToEndSessionTests.T01_T04_...` | PASS |
 | **T-05** | Bezpieczeństwa | 1-bajtowa mutacja HMAC na żywym serwerze i `diag-hmac` -> `204 ERR_INVALID_HMAC`, wpis `[SECURITY]` i natychmiastowy EOF | `PvspEndToEndSessionTests.T05_LiveServer_1ByteHmacMutation_ShouldReturn204_LogSecurity_AndCloseSocket`, `T05_T06_T08_Diagnostics_...` | PASS |
-| **T-06** | Bezpieczeństwa | Ochrona Replay: stary timestamp (-120s), `MsgID=0`, stare ID, luka w numeracji i zmodyfikowany duplikat -> `301 ERR_REPLAY_DETECTED` + EOF | `PvspEndToEndSessionTests.T05_T06_T08_Diagnostics_...`, `T06_Server_ShouldRejectMsgIdZero_OldMessageId_Gap_AndModifiedDuplicate_With301AndClose` | PASS |
+| **T-06** | Bezpieczeństwa | Ochrona Replay: stary i skrajne timestampy (`long.MinValue`/`MaxValue`), `MsgID=0`, stare ID, luka w numeracji i zmodyfikowany duplikat -> `301 ERR_REPLAY_DETECTED` + EOF | `ServerStorageAndAuthTests.T06_SessionHandler_ShouldRejectExtremeTimestamps_WithoutOverflow`, `PvspEndToEndSessionTests.T05_T06_T08_Diagnostics_...`, `T06_Server_ShouldRejectMsgIdZero_OldMessageId_Gap_AndModifiedDuplicate_With301AndClose` | PASS |
 | **T-07** | Odporności | Pofragmentowany strumień TCP (`56 B` HELLO w paczkach po 3 bajty co `50 ms`) składany przez `ReadExactly` | `ProtocolAndCryptoUnitTests.T07_FrameCodec_...`, `PvspEndToEndSessionTests.T07_LiveServer_ShouldReassembleFragmentedHello_3BytesEvery50ms` | PASS |
 | **T-08** | Odporności | Odrzucenie błędów framingu na żywym TLS i jednostkowo: Magic (`100` + echo `MsgID`), wersja (`101`), typ (`102`), > 64 KiB (`103` przed ładunkiem) + EOF | `ProtocolAndCryptoUnitTests.T08_FrameCodec_...`, `PvspEndToEndSessionTests.T08_LiveServer_ShouldRejectAllFramingErrors_100_101_102_103_AndCloseConnection` | PASS |
-| **T-09** | Odporności | *Auto-Reconnect* ponawia `GET` po restarcie; zerwanie po wysłaniu `SET` zwraca `IsUnknownMutationOutcome` (bez cichego retry) | `PvspEndToEndSessionTests.T09_T02_...`, `T09_ClientEngine_ShouldNotRetrySetMutation_WhenConnectionDropsAfterSend` | PASS |
-| **T-10** | Obciążeniowy | Rate Limiter (20 przechodzi, 5 odrzucone z `429`) + test obciążeniowy **50 równoległych sesji TLS 1.3** (`GET` + `SET`, limity `64`/`32`) | `PvspEndToEndSessionTests.T10_RateLimiter_...`, `T10_LoadTest_50ConcurrentSessions_ShouldMeetLatencyTargetAndReportPercentiles` | PASS |
-| **T-11** | Walidacji | Błędny UTF-8/JSON (`104`), nieznane/powtórzone/null pola, limity klucza/wartości > 32 KiB i niepuste `PING`/`BYE` (`106`), zła akcja (`107`), `LIST` > 1 000 kluczy lub > 64 KiB (`108`), nieoczekiwany `PONG` (`202`) | `ProtocolAndCryptoUnitTests.T11_StrictJsonValidator_...`, `ServerStorageAndAuthTests.T11_SessionHandler_...`, `PvspEndToEndSessionTests.T11_LiveServer_...` | PASS |
+| **T-09** | Odporności | *Auto-Reconnect* ponawia `GET` po restarcie oraz domyka zerwany transport i odzyskuje sesję przy `PING`; zerwanie po wysłaniu `SET` zwraca `IsUnknownMutationOutcome` (bez cichego retry) | `PvspEndToEndSessionTests.T09_T02_...`, `T09_ClientEngine_ShouldNotRetrySetMutation_WhenConnectionDropsAfterSend`, `T09_ClientEngine_SendPing_ShouldTearDownStaleTransportAndRecoverViaAutoReconnect` | PASS |
+| **T-10** | Obciążeniowy | Rate Limiter (20 przechodzi, 5 odrzucone z `429`) + test obciążeniowy **50 aktywnych sesji TLS 1.3** (200 równoległych `GET` + 50 sekwencyjnych `SET`, limity `64`/`32`) | `PvspEndToEndSessionTests.T10_RateLimiter_...`, `T10_LoadTest_50ConcurrentSessions_ShouldMeetLatencyTargetAndReportPercentiles` | PASS |
+| **T-11** | Walidacji | Błędny UTF-8/JSON (`104`), korzeń niebędący obiektem, błędne typy pól, nieznane/powtórzone/null pola, limity klucza/wartości > 32 KiB i niepuste `PING`/`BYE` (`106`), zła akcja (`107`), `LIST` > 1 000 kluczy lub > 64 KiB (`108`), nieoczekiwany `PONG` (`202`) | `ProtocolAndCryptoUnitTests.T11_StrictJsonValidator_...`, `ServerStorageAndAuthTests.T11_SessionHandler_...`, `PvspEndToEndSessionTests.T11_LiveServer_...` | PASS |
 | **T-12** | Persystencji i logów | Równoległe `SET`/`DELETE`, brak zmiany RAM przy błędzie dysku, zatrzymanie na zepsutym/`null` JSON, escapowanie znaków sterujących/ANSI (`\u001b`) i zero wycieków | `ServerStorageAndAuthTests.T12_VaultStorage_...` (3 testy), `T12_AuditLogger_...`, `ServerListenerAndSession_...` | PASS |
-| **P1–P3** | Utwardzenie i E2E | Odporność `timestamp` na overflow (`301`), bezwzględne deadline'y `HELLO`/`AUTH` i `AUTHENTICATED` idle timeout (`105`), monotoniczność `MsgID` + izolowany cache duplikatów + `ERROR <= 512 B`, 256-bit CSPRNG, recovery `PING`, żywy TLS Handshake Timeout + IPv6 `::1` + `KeepAliveWorker` + ustrukturyzowane logi UTC klienta | `ProtocolAndCryptoUnitTests.Priority2_CryptoHelper_...`, `ServerStorageAndAuthTests.Priority1_...` (3 testy), `SessionHandler_ShouldEnforceAuthenticatedIdleTimeout_...`, `PvspEndToEndSessionTests.Priority1_ClientEngine_SendPing_...`, `LiveServer_ShouldEnforceTlsHandshakeTimeout_KeepAliveWorker_Ipv6Loopback_AndStructuredClientLogs` | PASS |
+| **Ext** | Sesja i E2E | 256-bitowe tokeny/nonce/sekrety CSPRNG, bezwzględne deadline'y `HELLO`/`AUTH` i `AUTHENTICATED` idle timeout (`105`), monotoniczność `MsgID` + izolowany cache duplikatów + `ERROR <= 512 B`, żywy TLS Handshake Timeout + IPv6 `::1` + `KeepAliveWorker` + ustrukturyzowane logi UTC klienta | `ProtocolAndCryptoUnitTests.CryptoHelper_...`, `ServerStorageAndAuthTests.SessionHandler_ShouldEnforceAbsoluteHelloAndAuthDeadlines_...`, `SessionHandler_ShouldAdvanceSequenceIdOnNonClosingErrors_AndIsolateDuplicateCache`, `SessionHandler_ShouldEnforceAuthenticatedIdleTimeout_...`, `PvspEndToEndSessionTests.LiveServer_ShouldEnforceTlsHandshakeTimeout_KeepAliveWorker_Ipv6Loopback_AndStructuredClientLogs` | PASS |
 
 ### Zmierzony raport wydajności (`T-10` - 50 równoległych sesji)
 
-- **Zweryfikowany pełny zestaw testów (WSL2 `Ubuntu 24.04.1 LTS`, `.NET 8.0.34`, `12 CPUs`, Release):** `Total tests: 32 | Passed: 32 | Failed: 0 | Total time: 19.07 s` (`0 Warning(s), 0 Error(s)`).
-- **Metodologia pomiaru:** 50 równoległych klientów łączy się i uwierzytelnia jednocześnie z żywym serwerem działającym na **produkcyjnych limitach współbieżności (`maxSessions=64, maxHandshakes=32`)** na interfejsie loopback (`TLS_AES_256_GCM_SHA384`). Po rozgrzewce (1 zapytanie per sesja) wszystkie 50 aktywnych sesji wykonuje równolegle **200 operacji `GET` (`50 × 4`)** oraz **50 operacji `SET` (`50 × 1`)**. Mierzone i raportowane są osobno: **czas przetwarzania po stronie serwera (`Server Time`)** oraz **pełny round-trip po stronie klienta (`Client RTT`)** (HMAC, ramkowanie, TLS, wykonanie na serwerze i parsowanie odpowiedzi).
+- **Zweryfikowany pełny zestaw testów (WSL2 `Ubuntu 24.04.1 LTS`, `.NET 8.0.34`, `12 CPUs`, Release):** `Total tests: 32 | Passed: 32 | Failed: 0 | Total time: 17.92 s` (`0 Warning(s), 0 Error(s)`).
+- **Metodologia pomiaru:** 50 równoległych klientów łączy się i uwierzytelnia jednocześnie z żywym serwerem działającym na **produkcyjnych limitach współbieżności (`maxSessions=64, maxHandshakes=32`)** na interfejsie loopback (`TLS_AES_256_GCM_SHA384`). Po rozgrzewce (1 zapytanie per sesja), przy utrzymaniu wszystkich 50 aktywnych sesji, test wykonuje **200 równoległych operacji `GET` (`50 × 4`)**, a następnie **50 sekwencyjnych, persystowanych operacji `SET` (`50 × 1`)** na kolejnych sesjach. Mierzone i raportowane są osobno: **czas przetwarzania po stronie serwera (`Server Time`, asercja `< 15.00 ms` wg Etapu 2)** oraz **pełny round-trip po stronie klienta (`Client RTT`)** (HMAC, ramkowanie, TLS, wykonanie na serwerze i parsowanie odpowiedzi).
 
 | Operacja i zakres pomiaru | Próbki | `Avg` | `p50` (Mediana) | `p95` | Wymaganie docelowe |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| **`GET` — Czas przetwarzania serwera** | `200` (`50 × 4`) | **`0.13 ms`** | **`0.09 ms`** | **`0.20 ms`** | `< 15.00 ms` |
-| **`GET` — Pełny RTT klienta** | `200` (`50 × 4`) | **`9.20 ms`** | **`6.95 ms`** | **`19.17 ms`** | `< 15.00 ms` |
-| **`SET` — Czas przetwarzania serwera** *(atomowy zapis dyskowy)* | `50` (`50 × 1`) | **`3.97 ms`** | **`3.94 ms`** | **`4.82 ms`** | `< 15.00 ms` |
-| **`SET` — Pełny RTT klienta** *(atomowy zapis dyskowy)* | `50` (`50 × 1`) | **`4.59 ms`** | **`4.54 ms`** | **`5.39 ms`** | `< 15.00 ms` |
+| **`GET` — Czas przetwarzania serwera** *(równolegle)* | `200` (`50 × 4`) | **`0.13 ms`** | **`0.09 ms`** | **`0.12 ms`** | `< 15.00 ms` |
+| **`GET` — Pełny RTT klienta** *(równolegle)* | `200` (`50 × 4`) | **`7.30 ms`** | **`5.26 ms`** | **`11.76 ms`** | *Informacyjnie* |
+| **`SET` — Czas przetwarzania serwera** *(sekwencyjnie, zapis dyskowy)* | `50` (`50 × 1`) | **`3.61 ms`** | **`3.51 ms`** | **`3.98 ms`** | `< 15.00 ms` |
+| **`SET` — Pełny RTT klienta** *(sekwencyjnie, zapis dyskowy)* | `50` (`50 × 1`) | **`4.16 ms`** | **`4.07 ms`** | **`4.57 ms`** | *Informacyjnie* |
 
-> 📸 **Wynik testów automatycznych xUnit i raportu T-10 *(zrzuty z wersji bazowej 21/21; po utwardzeniu Priorytetów 1–3 pakiet rozszerzony do 32/32)***  
+> 📸 **Wynik testów automatycznych xUnit i raportu T-10 *(zrzuty z wersji bazowej 21/21; pakiet rozszerzony do 32/32)***  
 > ![Wynik testów xUnit bazowy](./docs/tests-output.png)
 > ![Wynik testów xUnit bazowy V2](./docs/tests-output-2.png)
 

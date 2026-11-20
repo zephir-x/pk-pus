@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -26,8 +26,13 @@ namespace Pus.Vault.Client
                 {
                     host = args[i + 1];
                 }
-                else if (args[i] == "--port" && int.TryParse(args[i + 1], out int parsedPort))
+                else if (args[i] == "--port")
                 {
+                    if (!int.TryParse(args[i + 1], out int parsedPort) || parsedPort < 1 || parsedPort > 65535)
+                    {
+                        Console.Error.WriteLine($"[STARTUP ERROR] Invalid --port value '{args[i + 1]}'. Expected integer in range 1..65535.");
+                        return 1;
+                    }
                     port = parsedPort;
                 }
                 else if (args[i] == "--ca")

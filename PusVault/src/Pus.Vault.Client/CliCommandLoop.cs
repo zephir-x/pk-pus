@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -117,8 +117,16 @@ namespace Pus.Vault.Client
 
                 case "exit":
                 case "quit":
+                    bool wasAuthenticated = _clientEngine.IsAuthenticated;
                     await _clientEngine.DisconnectAsync(clearCachedCredentials: true, ct);
-                    Console.WriteLine("[OK] Sent BYE (0x09) and closed TLS/TCP connection.");
+                    if (wasAuthenticated)
+                    {
+                        Console.WriteLine("[OK] Sent BYE (0x09) and closed TLS/TCP connection.");
+                    }
+                    else
+                    {
+                        Console.WriteLine("[INFO] Exiting (no active session).");
+                    }
                     return true;
 
                 default:

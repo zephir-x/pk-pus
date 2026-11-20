@@ -57,7 +57,7 @@ namespace Pus.Vault.Tests
         }
 
         [Fact]
-        public void Priority2_CryptoHelper_ShouldGenerate256BitSessionTokens_Nonces_AndHmacSecrets()
+        public void CryptoHelper_ShouldGenerate256BitSessionTokens_Nonces_AndHmacSecrets()
         {
             string token1 = PvspCryptoHelper.GenerateSessionToken();
             string token2 = PvspCryptoHelper.GenerateSessionToken();
@@ -182,6 +182,16 @@ namespace Pus.Vault.Tests
             byte[] nullFieldJson = Encoding.UTF8.GetBytes("{\"clientName\":null,\"timestamp\":123}");
             Assert.False(PvspJsonSerializer.TryParseStrictJsonObject(nullFieldJson, allowed, required, out _, out int errCode6, out _));
             Assert.Equal(PvspErrorCodes.InvalidPayload, errCode6);
+
+            // 7. Non-object JSON root (array instead of object) -> 106 ERR_INVALID_PAYLOAD
+            byte[] arrayRootJson = Encoding.UTF8.GetBytes("[1,2,3]");
+            Assert.False(PvspJsonSerializer.TryParseStrictJsonObject(arrayRootJson, allowed, required, out _, out int errCode7, out _));
+            Assert.Equal(PvspErrorCodes.InvalidPayload, errCode7);
+
+            // 8. Wrong JSON field type (string instead of integer for timestamp) -> TryGetInt64Field returns false
+            byte[] wrongTypeJson = Encoding.UTF8.GetBytes("{\"clientName\":\"Pus\",\"timestamp\":\"abc\"}");
+            Assert.True(PvspJsonSerializer.TryParseStrictJsonObject(wrongTypeJson, allowed, required, out var wrongTypeFields, out _, out _));
+            Assert.False(PvspJsonSerializer.TryGetInt64Field(wrongTypeFields, "timestamp", out _, out _));
         }
 
         [Fact]

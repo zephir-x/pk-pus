@@ -88,6 +88,20 @@ namespace Pus.Vault.Server
                     throw new InvalidDataException($"Invalid account configuration for user '{record.Username}'.");
                 }
 
+                try
+                {
+                    byte[] saltBytes = Convert.FromBase64String(record.SaltBase64);
+                    byte[] hashBytes = Convert.FromBase64String(record.PasswordHashBase64);
+                    if (saltBytes.Length < 16 || hashBytes.Length < 32)
+                    {
+                        throw new InvalidDataException($"Salt or hash length is below minimum security requirements for user '{record.Username}'.");
+                    }
+                }
+                catch (FormatException ex)
+                {
+                    throw new InvalidDataException($"Invalid Base64 salt or hash for user '{record.Username}'.", ex);
+                }
+
                 _users[record.Username] = record;
             }
         }
@@ -286,7 +300,6 @@ namespace Pus.Vault.Server
             if (_backoffTracker.Count < MaxBackoffTrackerEntries)
                 return;
 
-            // First remove expired entries past TTL
             List<string> expiredKeys = _backoffTracker
                 .Where(kvp => kvp.Value.LockoutUntilUtc <= now && now - kvp.Value.LastFailedUtc > BackoffEntryTtl)
                 .Select(kvp => kvp.Key)
@@ -297,11 +310,16 @@ namespace Pus.Vault.Server
                 _backoffTracker.Remove(key);
             }
 
-            // If still over capacity under a distributed spray attack, evict the oldest entries
             if (_backoffTracker.Count >= MaxBackoffTrackerEntries)
             {
-                int toEvict = (_backoffTracker.Count - MaxBackoffTrackerEntries) + (MaxBackoffTrackerEntries / 4);
-                foreach (string key in _backoffTracker.OrderBy(kvp => kvp.Value.LastFailedUtc).Take(toEvict).Select(kvp => kvp.Key).ToList())
+                int toEvict = Math.Max(1, _backoffTracker.Count / 4);
+                List<string> oldestKeys = _backoffTracker
+                    .OrderBy(kvp => kvp.Value.LastFailedUtc)
+                    .Take(toEvict)
+                    .Select(kvp => kvp.Key)
+                    .ToList();
+
+                foreach (string key in oldestKeys)
                 {
                     _backoffTracker.Remove(key);
                 }

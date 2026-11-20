@@ -12,7 +12,7 @@ namespace Pus.Vault.Server
 {
     /// <summary>
     /// Manages the stateful lifecycle of a single connected client session over an authenticated TLS 1.3 stream.
-    /// Enforces the PVSP state machine, absolute phase deadlines, anti-replay rules, sliding-window rate limits, and RBAC.
+    /// Enforces the PVSP state machine, absolute phase deadlines, write timeouts, anti-replay rules, sliding-window rate limits, and RBAC.
     /// </summary>
     public class ClientSessionHandler
     {
@@ -30,10 +30,11 @@ namespace Pus.Vault.Server
         private readonly SecurityAuditLogger _logger;
         private readonly Action<string, double>? _onDataReqCompleted;
 
-        // Configurable timeouts (defaulting to specification values: 10s HELLO, 15s AUTH, 60s Idle)
+        // Configurable timeouts (defaulting to specification values: 10s HELLO, 15s AUTH, 60s Idle, 5s Write)
         private readonly TimeSpan _helloTimeout;
         private readonly TimeSpan _authTimeout;
         private readonly TimeSpan _idleTimeout;
+        private readonly TimeSpan _writeTimeout = TimeSpan.FromSeconds(5);
 
         // Session state fields
         private PvspSessionState _state = PvspSessionState.TlsConnected;
@@ -137,6 +138,11 @@ namespace Pus.Vault.Server
             catch (OperationCanceledException) when (serverShutdownToken.IsCancellationRequested)
             {
                 // Clean server shutdown requested
+            }
+            catch (OperationCanceledException)
+            {
+                // Write timeout expired (e.g., slow-reader client stopped consuming TCP data)
+                _logger.LogWarn(_clientEndpoint, "Write timed out while sending response to client. Closing session.");
             }
             catch (Exception ex) when (ex is IOException or ObjectDisposedException)
             {
@@ -268,7 +274,7 @@ namespace Pus.Vault.Server
             };
 
             byte[] ackBytes = PvspJsonSerializer.SerializeToUtf8Bytes(ackPayload);
-            await PvspFrameCodec.WriteFrameAsync(_stream, PvspMessageType.HelloAck, frame.MessageId, ackBytes, ct);
+            await WriteFrameWithTimeoutAsync(PvspMessageType.HelloAck, frame.MessageId, ackBytes, ct);
             _logger.LogInfo(_clientEndpoint, $"Rcv MsgID={frame.MessageId} Type=HELLO Client={clientName} -> Sent HELLO_ACK.");
         }
 
@@ -341,7 +347,7 @@ namespace Pus.Vault.Server
             };
 
             byte[] ackBytes = PvspJsonSerializer.SerializeToUtf8Bytes(authAck);
-            await PvspFrameCodec.WriteFrameAsync(_stream, PvspMessageType.AuthAck, frame.MessageId, ackBytes, ct);
+            await WriteFrameWithTimeoutAsync(PvspMessageType.AuthAck, frame.MessageId, ackBytes, ct);
             _logger.LogInfo(_clientEndpoint, $"Rcv MsgID={frame.MessageId} Type=AUTH User={username} Role={sessionInfo.Role} -> Status=AUTHENTICATED.");
         }
 
@@ -361,7 +367,7 @@ namespace Pus.Vault.Server
             }
 
             _phaseDeadlineUtc = DateTime.UtcNow + _idleTimeout;
-            await PvspFrameCodec.WriteFrameAsync(_stream, PvspMessageType.Pong, frame.MessageId, Array.Empty<byte>(), ct);
+            await WriteFrameWithTimeoutAsync(PvspMessageType.Pong, frame.MessageId, Array.Empty<byte>(), ct);
             _logger.LogInfo(_clientEndpoint, $"Rcv MsgID={frame.MessageId} Type=PING -> Sent PONG.");
         }
 
@@ -447,10 +453,23 @@ namespace Pus.Vault.Server
 
             if (isDuplicate && _lastDataReqResponseFrameBytes != null)
             {
+                if (!IsTimestampFresh(timestamp))
+                {
+                    _logger.LogSecurity(_clientEndpoint, $"Replay detected on duplicate DATA_REQ MsgID={frame.MessageId}: timestamp {timestamp} outside +/-30s window.");
+                    await SendErrorAndCloseAsync(frame.MessageId, PvspErrorCodes.ReplayDetected, "Request timestamp is outside the allowed +/- 30s window.");
+                    return;
+                }
+
+                if (!CheckRateLimit())
+                {
+                    _logger.LogWarn(_clientEndpoint, $"Rate limit exceeded on duplicate DATA_REQ (max 20 DATA_REQ / 10s) on MsgID={frame.MessageId}.");
+                    await SendErrorAsync(frame.MessageId, PvspErrorCodes.RateLimit, "Rate limit exceeded: maximum 20 DATA_REQ per 10 seconds.", ct);
+                    return;
+                }
+
                 _phaseDeadlineUtc = DateTime.UtcNow + _idleTimeout;
                 _logger.LogWarn(_clientEndpoint, $"Duplicate MsgID={frame.MessageId} with identical digest -> Re-sending cached response.");
-                await _stream.WriteAsync(_lastDataReqResponseFrameBytes, ct);
-                await _stream.FlushAsync(ct);
+                await WriteRawWithTimeoutAsync(_lastDataReqResponseFrameBytes, ct);
                 return;
             }
 
@@ -587,8 +606,7 @@ namespace Pus.Vault.Server
             byte[] encodedFrame = PvspFrameCodec.EncodeFrame(PvspMessageType.DataResp, messageId, respBytes);
             CacheDuplicateResponse(messageId, requestDigest, encodedFrame);
 
-            await _stream.WriteAsync(encodedFrame, ct);
-            await _stream.FlushAsync(ct);
+            await WriteRawWithTimeoutAsync(encodedFrame, ct);
 
             if (_onDataReqCompleted != null)
             {
@@ -714,6 +732,21 @@ namespace Pus.Vault.Server
             return true;
         }
 
+        private async Task WriteFrameWithTimeoutAsync(PvspMessageType messageType, uint messageId, byte[] payloadBytes, CancellationToken ct)
+        {
+            using var writeCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            writeCts.CancelAfter(_writeTimeout);
+            await PvspFrameCodec.WriteFrameAsync(_stream, messageType, messageId, payloadBytes, writeCts.Token);
+        }
+
+        private async Task WriteRawWithTimeoutAsync(byte[] encodedFrame, CancellationToken ct)
+        {
+            using var writeCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            writeCts.CancelAfter(_writeTimeout);
+            await _stream.WriteAsync(encodedFrame, writeCts.Token);
+            await _stream.FlushAsync(writeCts.Token);
+        }
+
         private async Task SendErrorAsync(
             uint messageId,
             int errorCode,
@@ -737,8 +770,7 @@ namespace Pus.Vault.Server
                 CacheDuplicateResponse(messageId, cacheDigest, encodedFrame);
             }
 
-            await _stream.WriteAsync(encodedFrame, ct);
-            await _stream.FlushAsync(ct);
+            await WriteRawWithTimeoutAsync(encodedFrame, ct);
         }
 
         private async Task SendErrorAndCloseAsync(uint messageId, int errorCode, string message)
@@ -764,21 +796,21 @@ namespace Pus.Vault.Server
                 return string.Empty;
 
             var sb = new StringBuilder(input.Length);
-            int byteCount = 0;
-            foreach (Rune rune in input.EnumerateRunes())
+            foreach (char c in input)
             {
-                if (Rune.IsControl(rune))
-                    continue;
-
-                int runeBytes = rune.Utf8SequenceLength;
-                if (byteCount + runeBytes > maxUtf8Bytes)
-                    break;
-
-                sb.Append(rune);
-                byteCount += runeBytes;
+                if (!char.IsControl(c))
+                {
+                    sb.Append(c);
+                }
             }
 
-            return sb.ToString();
+            string cleaned = sb.ToString();
+            while (Encoding.UTF8.GetByteCount(cleaned) > maxUtf8Bytes && cleaned.Length > 0)
+            {
+                cleaned = cleaned[..^1];
+            }
+
+            return cleaned;
         }
     }
 }
