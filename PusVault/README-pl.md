@@ -352,7 +352,7 @@ dotnet test PusVault.sln --configuration Release --logger "console;verbosity=det
 | **`SET` — Czas przetwarzania serwera** *(sekwencyjnie, zapis dyskowy)* | `50` (`50 × 1`) | **`3.61 ms`** | **`3.51 ms`** | **`3.98 ms`** | `< 15.00 ms` |
 | **`SET` — Pełny RTT klienta** *(sekwencyjnie, zapis dyskowy)* | `50` (`50 × 1`) | **`4.16 ms`** | **`4.07 ms`** | **`4.57 ms`** | *Informacyjnie* |
 
-> 📸 **Wynik testów automatycznych xUnit i raportu T-10 *(zrzuty z wersji bazowej 21/21; pakiet rozszerzony do 32/32)***  
+> 📸 **Wynik testów automatycznych xUnit i raportu T-10**  
 > ![Wynik testów xUnit bazowy](./docs/tests-output.png)
 > ![Wynik testów xUnit bazowy V2](./docs/tests-output-2.png)
 
