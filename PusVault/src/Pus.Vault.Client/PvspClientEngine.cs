@@ -212,6 +212,7 @@ namespace Pus.Vault.Client
                     }
                     catch (Exception retryEx)
                     {
+                        CloseTransportInternal();
                         Log("ERROR", $"Operation '{action}' failed after reconnect: {retryEx.Message}");
                         return new ClientOperationResult
                         {
@@ -359,6 +360,8 @@ namespace Pus.Vault.Client
             await _ioLock.WaitAsync(ct);
             try
             {
+                IsRequestInFlight = true;
+
                 if (!IsAuthenticated || _sslStream == null)
                     return new ClientOperationResult { IsSuccess = false, Message = "Must be authenticated first." };
 
@@ -374,16 +377,30 @@ namespace Pus.Vault.Client
                 using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 timeoutCts.CancelAfter(_requestTimeout);
 
-                Log("INFO", $"Sending diagnostic corrupted-HMAC DATA_REQ (MsgID={msgId}).");
-                byte[] payloadBytes = PvspJsonSerializer.SerializeToUtf8Bytes(req);
-                await PvspFrameCodec.WriteFrameAsync(_sslStream, PvspMessageType.DataReq, msgId, payloadBytes, timeoutCts.Token);
+                try
+                {
+                    Log("INFO", $"Sending diagnostic corrupted-HMAC DATA_REQ (MsgID={msgId}).");
+                    byte[] payloadBytes = PvspJsonSerializer.SerializeToUtf8Bytes(req);
+                    await PvspFrameCodec.WriteFrameAsync(_sslStream, PvspMessageType.DataReq, msgId, payloadBytes, timeoutCts.Token);
 
-                FrameReadResult resp = await PvspFrameCodec.ReadFrameAsync(_sslStream, timeoutCts.Token);
-                CloseTransportInternal(); // Server closes connection on 204 ERR_INVALID_HMAC
-                return ParseServerResponse(resp, msgId, "LIST");
+                    FrameReadResult resp = await PvspFrameCodec.ReadFrameAsync(_sslStream, timeoutCts.Token);
+                    CloseTransportInternal(); // Server closes connection on 204 ERR_INVALID_HMAC
+                    return ParseServerResponse(resp, msgId, "LIST");
+                }
+                catch (Exception ex)
+                {
+                    CloseTransportInternal();
+                    Log("ERROR", $"Diagnostic corrupted-HMAC request failed: {ex.Message}");
+                    return new ClientOperationResult
+                    {
+                        IsSuccess = false,
+                        Message = $"Diagnostic request failed: {ex.Message}"
+                    };
+                }
             }
             finally
             {
+                IsRequestInFlight = false;
                 _ioLock.Release();
             }
         }
@@ -397,6 +414,8 @@ namespace Pus.Vault.Client
             await _ioLock.WaitAsync(ct);
             try
             {
+                IsRequestInFlight = true;
+
                 if (!IsAuthenticated || _sslStream == null)
                     return new ClientOperationResult { IsSuccess = false, Message = "Must be authenticated first." };
 
@@ -412,16 +431,30 @@ namespace Pus.Vault.Client
                 using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 timeoutCts.CancelAfter(_requestTimeout);
 
-                Log("INFO", $"Sending diagnostic expired-timestamp DATA_REQ (MsgID={msgId}).");
-                byte[] payloadBytes = PvspJsonSerializer.SerializeToUtf8Bytes(req);
-                await PvspFrameCodec.WriteFrameAsync(_sslStream, PvspMessageType.DataReq, msgId, payloadBytes, timeoutCts.Token);
+                try
+                {
+                    Log("INFO", $"Sending diagnostic expired-timestamp DATA_REQ (MsgID={msgId}).");
+                    byte[] payloadBytes = PvspJsonSerializer.SerializeToUtf8Bytes(req);
+                    await PvspFrameCodec.WriteFrameAsync(_sslStream, PvspMessageType.DataReq, msgId, payloadBytes, timeoutCts.Token);
 
-                FrameReadResult resp = await PvspFrameCodec.ReadFrameAsync(_sslStream, timeoutCts.Token);
-                CloseTransportInternal(); // Server closes connection on 301 ERR_REPLAY_DETECTED
-                return ParseServerResponse(resp, msgId, "LIST");
+                    FrameReadResult resp = await PvspFrameCodec.ReadFrameAsync(_sslStream, timeoutCts.Token);
+                    CloseTransportInternal(); // Server closes connection on 301 ERR_REPLAY_DETECTED
+                    return ParseServerResponse(resp, msgId, "LIST");
+                }
+                catch (Exception ex)
+                {
+                    CloseTransportInternal();
+                    Log("ERROR", $"Diagnostic expired-timestamp request failed: {ex.Message}");
+                    return new ClientOperationResult
+                    {
+                        IsSuccess = false,
+                        Message = $"Diagnostic request failed: {ex.Message}"
+                    };
+                }
             }
             finally
             {
+                IsRequestInFlight = false;
                 _ioLock.Release();
             }
         }
@@ -435,6 +468,8 @@ namespace Pus.Vault.Client
             await _ioLock.WaitAsync(ct);
             try
             {
+                IsRequestInFlight = true;
+
                 if (_sslStream == null)
                     return new ClientOperationResult { IsSuccess = false, Message = "Not connected." };
 
@@ -450,16 +485,30 @@ namespace Pus.Vault.Client
                 using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 timeoutCts.CancelAfter(_requestTimeout);
 
-                Log("INFO", $"Sending diagnostic invalid-magic header (MsgID={msgId}).");
-                await _sslStream.WriteAsync(badHeader, timeoutCts.Token);
-                await _sslStream.FlushAsync(timeoutCts.Token);
+                try
+                {
+                    Log("INFO", $"Sending diagnostic invalid-magic header (MsgID={msgId}).");
+                    await _sslStream.WriteAsync(badHeader, timeoutCts.Token);
+                    await _sslStream.FlushAsync(timeoutCts.Token);
 
-                FrameReadResult resp = await PvspFrameCodec.ReadFrameAsync(_sslStream, timeoutCts.Token);
-                CloseTransportInternal();
-                return ParseServerResponse(resp, msgId);
+                    FrameReadResult resp = await PvspFrameCodec.ReadFrameAsync(_sslStream, timeoutCts.Token);
+                    CloseTransportInternal();
+                    return ParseServerResponse(resp, msgId);
+                }
+                catch (Exception ex)
+                {
+                    CloseTransportInternal();
+                    Log("ERROR", $"Diagnostic invalid-magic request failed: {ex.Message}");
+                    return new ClientOperationResult
+                    {
+                        IsSuccess = false,
+                        Message = $"Diagnostic request failed: {ex.Message}"
+                    };
+                }
             }
             finally
             {
+                IsRequestInFlight = false;
                 _ioLock.Release();
             }
         }
